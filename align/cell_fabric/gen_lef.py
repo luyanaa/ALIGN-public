@@ -89,7 +89,9 @@ def json_lef(input_json, out_lef, bodyswitch, blockM, p, *, mode='routing'):
     Scale_factor = j1["ScaleFactor"]
 
     m2pitch = p['M2']['Pitch']
-    m3pitch = p['M3']['Pitch']
+    # TR-1um is a 2-metal process (no M3): fall back to the M2 pitch for the
+    # pin-pitch computation instead of crashing.
+    m3pitch = p['M3']['Pitch'] if 'M3' in p else p['M2']['Pitch']
 
     with open(input_json, "rt") as fp:
         layout_d = json.load(fp)
