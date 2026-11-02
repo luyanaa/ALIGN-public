@@ -161,6 +161,18 @@ class CmdlineParser():
                             default=0,
                             help='Random number generator seed for the placement algorithm')
 
+        parser.add_argument('--wire_planner',
+                            action='store_true',
+                            help='Run the RALF-style negotiated tile-grid '
+                                 'wire planner after placement and write '
+                                 'route-guide + congestion-report JSON')
+
+        parser.add_argument('--rl_episodes',
+                            type=int,
+                            default=200,
+                            help='Training episodes for the RL placer '
+                                 '(only with --placer rl)')
+
         parser.add_argument('--ilp_solver',
                             type=str,
                             default='symphony',
@@ -173,9 +185,14 @@ class CmdlineParser():
                             help="Runtime limit in seconds for ILP in each iteration of placement")
 
         parser.add_argument('--placer',
-                            choices=['cpp', 'python'],
+                            choices=['cpp', 'python', 'sa_pack', 'rl'],
                             default='cpp',
-                            help='Select the placer engine to use. Default: %(default)s')
+                            help='Select the placer engine to use. '
+                                 "'sa_pack' is the RALF-style sequence-pair "
+                                 "annealer (HPWL + sqrt(RUDY congestion)); "
+                                 "'rl' is the PPO placer (needs torch, "
+                                 "falls back to sa_pack). "
+                                 'Default: %(default)s')
 
         parser.add_argument('-b',
                             '--blackbox_dir',

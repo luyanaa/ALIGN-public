@@ -165,6 +165,28 @@ For a full list of options supported by the tool, please use the following comma
 schematic2layout.py -h
 ```
 
+#### RALF-style placer and wire planner (experimental)
+
+Two additional placer backends implement the cost model from
+[RALF](https://github.com/iic-jku/IIC-RALF) (Ratschenberger & Pretl,
+TechRxiv 2024) -- energy = `HPWL + sqrt(RUDY congestion)`:
+
+* `--placer sa_pack` -- sequence-pair simulated-annealing placer (pure
+  Python, no extra dependencies).
+* `--placer rl` -- PPO-trained sequential placer (requires `torch`; falls
+  back to `sa_pack` with a warning when torch is not installed). Tune the
+  training length with `--rl_episodes N`.
+
+Both emit standard scaled `placement_verilog` alternatives, so
+`3_pnr:route` runs unchanged downstream.
+
+`--wire_planner` additionally runs a RALF-style negotiated tile-grid wire
+planner during `3_pnr:route` and writes, per variant,
+`<TOP>_wireplan.json` (route guides in the `WriteGcellGlobalRoute` "wires"
+schema) and `<TOP>_wireplan_report.json` (per-tile demand/supply
+congestion map). These are preview/analysis outputs -- the C++ detail
+router does not consume external guides.
+
 If you get an error `libOsiCbc.so: cannot open shared object file`, please add `${ALIGN_HOME}/_skbuild/<OSname_Arch_PythonVer>/cmake-install/lib` to your `LD_LIBRARY_PATH`.
 `${ALIGN_HOME}` is the path where ALIGN is installed.
 For e.g.:

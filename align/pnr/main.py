@@ -189,7 +189,8 @@ def write_verilog_d(verilog_d):
 def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, primitives, nvariants=1, effort=0, extract=False,
                  gds_json=False, PDN_mode=False, router_mode='top_down', router='astar', gui=False, skipGDS=False, steps_to_run,lambda_coeff,
                  nroutings=1, select_in_ILP=False, place_using_ILP=False, seed=0, use_analytical_placer=False, ilp_solver='symphony',
-                 placer_sa_iterations=10000, placer_ilp_runtime=1, placer=None, black_box_flow=False, ndrfn=None, gui_port=None):
+                 placer_sa_iterations=10000, placer_ilp_runtime=1, placer=None, black_box_flow=False, ndrfn=None, gui_port=None,
+                 rl_episodes=200, wire_planner=False):
 
     subckt = subckt.upper()
 
@@ -346,13 +347,39 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
                            'nvariants': nvariants,
                            'effort': effort}
 
-        top_level, leaf_map, placement_verilog_alternatives, metrics = \
-            placer_driver(cap_map=cap_map, cap_lef_s=cap_lef_s,
-                          lambda_coeff=lambda_coeff, scale_factor=scale_factor,
-                          select_in_ILP=select_in_ILP, place_using_ILP=place_using_ILP, seed=seed,
-                          use_analytical_placer=use_analytical_placer, ilp_solver=ilp_solver, primitives=primitives,
-                          toplevel_args_d=toplevel_args_d, results_dir=None,
-                          placer_sa_iterations=placer_sa_iterations, placer_ilp_runtime=placer_ilp_runtime, black_box_flow=black_box_flow)
+        if placer in ('sa_pack', 'rl'):
+            # RALF-style Python placer: bypasses the C++ engine and emits
+            # scaled placement_verilog alternatives directly.  The
+            # __placer_dump__.json contract is kept so 3_pnr:route works
+            # unchanged.
+            from .placer_rl.driver import rl_placer_driver
+            from .placer_rl.leaf_collateral import load_leaf_collateral, leaf_sizes
+
+            collateral = load_leaf_collateral(input_dir, primitives)
+            sizes = leaf_sizes(collateral)
+
+            with (input_dir / verilog_file).open('rt') as fp:
+                verilog_d_in = json.load(fp)
+
+            alts = rl_placer_driver(
+                verilog_d_in, primitives, sizes, subckt,
+                engine=placer, seed=seed, nvariants=nvariants,
+                sa_steps=placer_sa_iterations, rl_episodes=rl_episodes,
+                leaf_collateral=collateral)
+
+            top_level = subckt
+            leaf_map = {}
+            placement_verilog_alternatives = {
+                nm: VerilogJsonTop.parse_obj(v) for nm, v in alts.items()}
+            metrics = {nm: {'concrete_name': nm} for nm in alts}
+        else:
+            top_level, leaf_map, placement_verilog_alternatives, metrics = \
+                placer_driver(cap_map=cap_map, cap_lef_s=cap_lef_s,
+                              lambda_coeff=lambda_coeff, scale_factor=scale_factor,
+                              select_in_ILP=select_in_ILP, place_using_ILP=place_using_ILP, seed=seed,
+                              use_analytical_placer=use_analytical_placer, ilp_solver=ilp_solver, primitives=primitives,
+                              toplevel_args_d=toplevel_args_d, results_dir=None,
+                              placer_sa_iterations=placer_sa_iterations, placer_ilp_runtime=placer_ilp_runtime, black_box_flow=black_box_flow)
 
         with open(working_dir/"__placer_dump__.json", "wt") as fp:
             json.dump((top_level, leaf_map, [(nm, verilog_d.dict()) for nm, verilog_d in placement_verilog_alternatives.items()],metrics), fp=fp, indent=2)
@@ -408,6 +435,25 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
                            'nvariants': nvariants,
                            'effort': effort,
                            'pdk_dir': pdk_dir}
+
+        if wire_planner:
+            # RALF-style negotiated wire planning (preview/analysis output).
+            # The C++ detail router does not consume external guides, so
+            # this runs alongside it and writes JSON collateral.
+            from .wire_planner import plan_from_placement
+            from .placer_rl.leaf_collateral import load_leaf_collateral
+            wp_collateral = load_leaf_collateral(input_dir, primitives)
+            for variant_name, v_d in verilog_ds_to_run:
+                try:
+                    guides, report = plan_from_placement(
+                        v_d, wp_collateral)
+                    (working_dir / f'{variant_name}_wireplan.json').write_text(
+                        json.dumps(guides, indent=2))
+                    (working_dir / f'{variant_name}_wireplan_report.json').write_text(
+                        json.dumps(report, indent=2))
+                    logger.info(f'wire plan written for {variant_name}')
+                except Exception:
+                    logger.exception(f'wire planner failed for {variant_name}')
 
         results_name_map = router_driver(cap_map=cap_map, cap_lef_s=cap_lef_s,
                                          numLayout=toplevel_args_d['nvariants'], effort=toplevel_args_d['effort'],
