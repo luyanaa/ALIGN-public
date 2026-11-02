@@ -37,10 +37,12 @@ class PlacementProblem:
             ``(x, y)`` terminal coordinates for module pins.
     """
 
-    def __init__(self, name, instances, nets):
+    def __init__(self, name, instances, nets, symmetry=None):
         self.name = name
         self.instances = instances
         self.nets = nets
+        # [{pairs: [[inst_idx,...],...], direction: 'V'|'H'}]
+        self.symmetry = symmetry or []
 
     @property
     def n(self):
@@ -155,6 +157,60 @@ def overlap_area(placement, problem):
         for j in range(i + 1, len(items)):
             area += _strict_intersection_area(items[i][1], items[j][1])
     return area
+
+
+def symmetry_penalty(placement, problem):
+    """Squared violation of the module's ``SymmetricBlocks`` constraints.
+
+    Mirrors the semantics of ``align.schema.constraint.SymmetricBlocks``:
+    for direction 'V' (vertical mirror axis) every pair contributes the
+    x-coordinates of its centerline; self-symmetric single instances count
+    their own centerline.  All pairs must share the same centerline
+    ``reference``, and paired (non-self) blocks must additionally align
+    their perpendicular centerline within a quarter of the block height.
+
+    The penalty is the squared L2 deviation so it scales like the HPWL
+    term (quadratic in length units).  ``problem.symmetry`` is a list of
+    ``{'pairs': [[inst_idx, ...], ...], 'direction': 'V'|'H'}`` entries.
+    """
+    sym = getattr(problem, 'symmetry', None)
+    if not sym:
+        return 0.0
+    boxes = problem.placements_to_boxes(placement)
+    insts = problem.instances
+    pen = 0.0
+    for group in sym:
+        direction = group['direction']
+        ref = None
+        for pair in group['pairs']:
+            # centerline sum along the mirror direction
+            cl = 0.0
+            for idx in pair:
+                b = boxes[idx]
+                cl += (b[0] + b[2]) if direction == 'V' else (b[1] + b[3])
+            if ref is None:
+                ref = cl
+            else:
+                pen += (cl - ref) ** 2
+            if len(pair) == 2:
+                # perpendicular centerlines must match within
+                # quarter-block-size of each block
+                i0, i1 = pair
+                b0, b1 = boxes[i0], boxes[i1]
+                if direction == 'V':
+                    c0, c1 = b0[1] + b0[3], b1[1] + b1[3]
+                    h0 = b0[3] - b0[1]
+                    h1 = b1[3] - b1[1]
+                else:
+                    c0, c1 = b0[0] + b0[2], b1[0] + b1[2]
+                    h0 = b0[2] - b0[0]
+                    h1 = b1[2] - b1[0]
+                # violation beyond the 1/4-height slack (both bounds must
+                # hold, so the violation is the larger of the two excesses)
+                v0 = max(abs(2 * (c0 - c1)) - h0, 0)
+                v1 = max(abs(2 * (c0 - c1)) - h1, 0)
+                pen += max(v0, v1) ** 2
+    return pen
 
 
 def make_cost(problem, weight_congestion=1.0, weight_overlap=1.0):

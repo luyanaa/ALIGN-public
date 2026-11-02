@@ -183,7 +183,13 @@ class RLPlacementSolver:
             if ep % 50 == 0:
                 logger.info(f'RL placer ({self.problem.name}): episode {ep}, '
                             f'reward {reward:.2f}, best {best_reward:.2f}')
-        return best_placement, None, -best_reward
+        if best_placement is not None:
+            boxes = self.problem.placements_to_boxes(best_placement)
+            bbox = (max(b[2] for b in boxes.values()),
+                    max(b[3] for b in boxes.values()))
+        else:
+            bbox = None
+        return best_placement, bbox, -best_reward
 
     def _update(self, traj):  # pragma: no cover
         rewards = [t[6] for t in traj]

@@ -77,7 +77,30 @@ def build_problem(module, leaf_sizes, ctn_of=None):
                 {'inst': idx_of[inst['instance_name']], 'pin': fa['formal']})
 
     net_list = [{'name': n, 'pins': p} for n, p in nets.items() if len(p) > 1]
-    return PlacementProblem(_modname(module), instances, net_list)
+
+    # translate SymmetricBlocks constraints to instance indices
+    symmetry = []
+    for c in module.get('constraints', []):
+        if c.get('constraint') == 'SymmetricBlocks':
+            pairs = []
+            ok = True
+            for pair in c['pairs']:
+                idx_pair = []
+                for name in pair:
+                    if name in idx_of:
+                        idx_pair.append(idx_of[name])
+                    else:
+                        ok = False
+                        break
+                if not ok:
+                    break
+                pairs.append(idx_pair)
+            if ok and pairs:
+                symmetry.append({'pairs': pairs,
+                                 'direction': c.get('direction', 'V')})
+
+    return PlacementProblem(_modname(module), instances, net_list,
+                            symmetry=symmetry)
 
 
 def _bottom_up_order(modules, top_name):
