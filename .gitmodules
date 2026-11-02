@@ -1,0 +1,3 @@
+[submodule "pdks/sky130"]
+	path = pdks/sky130
+	url = https://github.com/ALIGN-analoglayout/ALIGN-pdk-sky130
