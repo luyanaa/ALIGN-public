@@ -76,7 +76,12 @@ export CXX=/path/to/your/g++
 ```console
 git clone https://github.com/ALIGN-analoglayout/ALIGN-public
 cd ALIGN-public
+git submodule update --init
 ```
+
+The sky130 PDK is pulled in as a submodule at `deps/ALIGN-pdk-sky130`;
+`pdks/sky130` is a symlink into that checkout so `pdks/<name>` layout
+matches the other PDKs. Skip the submodule step if you don't need sky130.
 
 ### Step 2: Create a [Python virtualenv](https://docs.python.org/3/tutorial/venv.html) and install dependencies
 Note: You may choose to skip this step if you are doing a system-wide install for multiple users.

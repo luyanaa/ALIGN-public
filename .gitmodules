@@ -1,3 +1,6 @@
-[submodule "pdks/sky130"]
-	path = pdks/sky130
+[submodule "deps/ALIGN-pdk-sky130"]
+	path = deps/ALIGN-pdk-sky130
 	url = https://github.com/ALIGN-analoglayout/ALIGN-pdk-sky130
+[submodule "deps/ALIGN-pdk-asap7"]
+	path = deps/ALIGN-pdk-asap7
+	url = https://github.com/ALIGN-analoglayout/ALIGN-pdk-asap7
