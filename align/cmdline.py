@@ -109,8 +109,18 @@ class CmdlineParser():
         parser.add_argument('--router',
                             type=str,
                             default='astar',
-                            choices=['astar','hanan'],
-                            help='Router to use')
+                            choices=['astar','hanan','detail_py','detail_py_mip'],
+                            help='Router to use. ''detail_py''/''detail_py_mip'' '
+                                 'select the Python track-aligned detailed '
+                                 'router (SAT / MIP backend) instead of the '
+                                 'C++ GcellDetailRouter')
+
+        parser.add_argument('--detail_router_workers',
+                            type=int,
+                            default=None,
+                            help='Number of parallel regions for the Python '
+                                 'detailed router (default: number of spatial '
+                                 'regions, capped by cpu_count)')
 
         parser.add_argument('--gui',
                             action='store_true',

@@ -190,7 +190,7 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
                  gds_json=False, PDN_mode=False, router_mode='top_down', router='astar', gui=False, skipGDS=False, steps_to_run,lambda_coeff,
                  nroutings=1, select_in_ILP=False, place_using_ILP=False, seed=0, use_analytical_placer=False, ilp_solver='symphony',
                  placer_sa_iterations=10000, placer_ilp_runtime=1, placer=None, black_box_flow=False, ndrfn=None, gui_port=None,
-                 rl_episodes=200, wire_planner=False):
+                 rl_episodes=200, wire_planner=False, detail_router_workers=None):
 
     subckt = subckt.upper()
 
@@ -455,16 +455,38 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
                 except Exception:
                     logger.exception(f'wire planner failed for {variant_name}')
 
-        results_name_map = router_driver(cap_map=cap_map, cap_lef_s=cap_lef_s,
-                                         numLayout=toplevel_args_d['nvariants'], effort=toplevel_args_d['effort'],
-                                         adr_mode=False, PDN_mode=PDN_mode,
-                                         router_mode=router_mode, router=router, skipGDS=skipGDS, scale_factor=scale_factor,
-                                         nroutings=nroutings, primitives=primitives, toplevel_args_d=toplevel_args_d, results_dir=None,
-                                         verilog_ds_to_run=verilog_ds_to_run)
+        if router in ('detail_py', 'detail_py_mip'):
+            # Python track-aligned detailed router (detail_router pkg).
+            # Runs from the scaled placement verilog + leaf collateral
+            # and emits the same ``Results/<variant>.json`` schema the
+            # C++ router produces, so downstream viewer/GDS steps are
+            # unchanged.  ``detail_py`` uses the SAT backend,
+            # ``detail_py_mip`` the MIP backend.
+            results_name_map = _detail_py_route(
+                verilog_ds_to_run=verilog_ds_to_run,
+                backend='sat' if router == 'detail_py' else 'mip',
+                input_dir=input_dir,
+                pdk_file=pdk_file,
+                working_dir=working_dir,
+                primitives=primitives,
+                n_workers=detail_router_workers,
+                wire_planner=wire_planner)
+        else:
+            results_name_map = router_driver(cap_map=cap_map, cap_lef_s=cap_lef_s,
+                                             numLayout=toplevel_args_d['nvariants'], effort=toplevel_args_d['effort'],
+                                             adr_mode=False, PDN_mode=PDN_mode,
+                                             router_mode=router_mode, router=router, skipGDS=skipGDS, scale_factor=scale_factor,
+                                             nroutings=nroutings, primitives=primitives, toplevel_args_d=toplevel_args_d, results_dir=None,
+                                             verilog_ds_to_run=verilog_ds_to_run)
 
 
         os.chdir(current_working_dir)
-        if router != "hanan":
+        if router in ('detail_py', 'detail_py_mip'):
+            # python router emits Results/<variant>.json directly; mark
+            # each variant as produced so downstream steps can pick it up
+            for variant in results_name_map:
+                variants[variant].update({'errors': 0})
+        elif router != "hanan":
             for variant, (path_name, layout_idx, DB) in results_name_map.items():
 
                 hN = DB.hierTree[layout_idx]
@@ -490,3 +512,59 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
 
 
     return variants
+
+
+def _detail_py_route(*, verilog_ds_to_run, backend, input_dir, pdk_file,
+                     working_dir, primitives, n_workers, wire_planner):
+    """Run the Python detailed router over every placement variant.
+
+    Writes ``Results/<variant>.json`` (router-output schema) and returns
+    ``{variant: None}`` for bookkeeping -- the file itself is the result.
+    """
+    from .detail_router.driver import detail_route_module
+    from .placer_rl.leaf_collateral import load_leaf_collateral
+
+    pdk_json = json.loads((input_dir / pdk_file).read_text())
+    leaf_collateral = load_leaf_collateral(input_dir, primitives)
+
+    results_dir = working_dir / 'Results'
+    results_dir.mkdir(exist_ok=True)
+    produced = {}
+    for variant_name, v_d in verilog_ds_to_run:
+        # ``v_d`` may be a VerilogJsonTop (pydantic) or a plain dict
+        md = v_d.dict() if hasattr(v_d, 'dict') else v_d
+        module = md['modules'][-1]
+        guides = None
+        if wire_planner:
+            wp = working_dir / f'{variant_name}_wireplan.json'
+            if wp.is_file():
+                raw = json.loads(wp.read_text())
+                wires = raw.get('wires', raw) if isinstance(raw, dict) else raw
+                guides = [
+                    {'net': w.get('net') or w.get('netName'),
+                     'layer': w.get('layer'),
+                     'rect': w.get('rect') or w.get('bbox')}
+                    for w in wires]
+        try:
+            terminals, report = detail_route_module(
+                module, leaf_collateral, pdk_json,
+                wire_guides=guides, backend=backend,
+                n_workers=n_workers, input_dir=input_dir)
+        except Exception:
+            logger.exception(f'detail_py router failed for {variant_name}')
+            continue
+        if report.get('status') != 'ok':
+            logger.error(f'detail_py router failed for {variant_name}: '
+                         f'{report}')
+            continue
+        out = {'bbox': module['bbox'],
+               'globalRoutes': [],
+               'globalRouteGrid': [],
+               'terminals': terminals}
+        (results_dir / f'{variant_name}.json').write_text(
+            json.dumps(out, indent=2))
+        logger.info(f'detail_py router: {variant_name} -> '
+                    f'{report["terminals"]} terminals, '
+                    f'{report["nets"]} nets')
+        produced[variant_name] = None
+    return produced

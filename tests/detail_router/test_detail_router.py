@@ -129,13 +129,10 @@ def _ftota_module():
 
 
 def _collateral():
-    from align.pnr.main import gen_leaf_collateral
+    from align.pnr.placer_rl.leaf_collateral import load_leaf_collateral
     primitives = json.loads(
         (E2E / '2_primitives/__primitives__.json').read_text())
-    return gen_leaf_collateral(
-        leaves={v['abstract_template_name'] for v in primitives.values()},
-        primitives=primitives,
-        primitive_dir=E2E / '2_primitives')
+    return load_leaf_collateral(E2E / '3_pnr/inputs', primitives)
 
 
 @pytest.mark.skipif(
@@ -146,7 +143,8 @@ def test_ftota_sat_routes_all_nets():
     from align.pnr.detail_router.driver import detail_route_module
     pdk = json.loads((E2E / '3_pnr/inputs/layers.json').read_text())
     terminals, report = detail_route_module(
-        _ftota_module(), _collateral(), pdk, backend='sat', n_workers=1)
+        _ftota_module(), _collateral(), pdk, backend='sat', n_workers=1,
+        input_dir=E2E / '3_pnr/inputs')
     assert report['status'] == 'ok'
     nets = {t['netName'] for t in terminals}
     assert nets >= {'VIN', 'VIP', 'VOP', 'VON', 'VDD', 'VSS', 'TAIL'}
@@ -160,5 +158,6 @@ def test_ftota_mip_routes_all_nets():
     from align.pnr.detail_router.driver import detail_route_module
     pdk = json.loads((E2E / '3_pnr/inputs/layers.json').read_text())
     terminals, report = detail_route_module(
-        _ftota_module(), _collateral(), pdk, backend='mip', n_workers=1)
+        _ftota_module(), _collateral(), pdk, backend='mip', n_workers=1,
+        input_dir=E2E / '3_pnr/inputs')
     assert report['status'] == 'ok'

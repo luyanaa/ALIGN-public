@@ -43,65 +43,76 @@ def _transform_rect(tr, rect):
     return (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
 
 
-def collect_nets_and_obstacles(module, leaf_collateral):
-    """Flatten a placed module into per-net pin shapes + obstacles.
+def collect_nets_and_obstacles(module, leaf_collateral,
+                               input_dir=None):
+    """Flatten a placed module into per-net pin access points.
 
-    ``module`` is a module dict from the scaled placement verilog;
-    ``leaf_collateral`` is ``{ctn: {'.json': path}}`` (the map built by
-    ``gen_leaf_collateral``).
+    ``module`` is a module dict from the scaled placement verilog.
+    ``leaf_collateral`` is ``{ctn: {'bbox','terminals'}}`` as returned
+    by ``placer_rl.leaf_collateral.load_leaf_collateral`` --
+    ``terminals`` is already grouped ``{pin_name: [{layer,rect}]}`` so
+    each pin's multi-layer access shapes collapse to one logical pin.
+    ``input_dir`` (optional) additionally reads ``<ctn>.json`` to
+    collect *blockage* shapes (terminals with no pin name) as routing
+    obstacles.
 
     Returns ``(net_pins, obstacles, boundary_nets)``:
-      * ``net_pins``:    ``{net: [pin, ...]}`` where each *pin* is a set
-        of ``(x, y, layer)`` access points.  One pin == one
-        ``(instance, formal)`` pair -- all metal shapes of that pin on
-        every layer are internally connected inside the leaf, so the
-        router only needs to touch any one of them.
-      * ``obstacles``:   ``{layer: [rect,...]}`` shapes on routing
-        layers that block cells (instance metal not on a net's pin)
+      * ``net_pins``:    ``{net: [set-of-(x,y,layer) pts, ...]}`` -- one
+        pin == one ``(instance, formal)`` pair
+      * ``obstacles``:   ``{layer: [rect,...]}`` blockage shapes on
+        routing layers (requires ``input_dir``)
       * ``boundary_nets``: set of nets that are top-level ports
     """
-    leaf_json = {}
-    for ctn, files in leaf_collateral.items():
-        p = files.get('.json')
-        if p and pathlib.Path(p).is_file():
-            leaf_json[ctn] = json.loads(pathlib.Path(p).read_text())
-
     params = set(module.get('parameters', []))
     net_pins = {}
     pin_of = {}                     # (net, inst, formal) -> pin index
     obstacles = {}
     boundary_nets = set()
 
+    # optional second pass for blockage shapes
+    blockages = {}
+    if input_dir is not None:
+        idir = pathlib.Path(input_dir)
+        for inst in module['instances']:
+            ctn = inst['concrete_template_name']
+            fn = idir / f'{ctn}.json'
+            if fn.is_file() and ctn not in blockages:
+                blockages[ctn] = json.loads(fn.read_text())\
+                    .get('terminals', [])
+
     for inst in module['instances']:
         ctn = inst['concrete_template_name']
         tr = inst['transformation']
-        leaf = leaf_json.get(ctn)
+        leaf = leaf_collateral.get(ctn)
         if leaf is None:
             continue
         fa = {f['formal']: f['actual'] for f in inst['fa_map']}
-        for term in leaf.get('terminals', []):
-            layer = term['layer']
-            net_local = term.get('netName')
-            rect = _transform_rect(tr, term['rect'])
-            if layer not in ROUTE_LAYERS:
+        # ``leaf['terminals']`` is {pin_name: [{layer,rect}, ...]}
+        for pin_name, rects in leaf.get('terminals', {}).items():
+            net = fa.get(pin_name)
+            if net is None:
                 continue
-            net = fa.get(net_local)
-            # every metal rect tagged with a net name is an access
-            # shape of that net's pin on this instance ('pin' marks the
-            # primary access; 'drawing' copies of the same pin still
-            # expose the net on that layer)
-            if net_local is not None and net:
-                key = (net, inst['instance_name'], net_local)
-                if key not in pin_of:
-                    pin_of[key] = len(net_pins.setdefault(net, []))
-                    net_pins[net].append(set())
-                pin = net_pins[net][pin_of[key]]
-                for pt in _sample_rect_points(rect, layer):
+            key = (net, inst['instance_name'], pin_name)
+            if key not in pin_of:
+                pin_of[key] = len(net_pins.setdefault(net, []))
+                net_pins[net].append(set())
+            pin = net_pins[net][pin_of[key]]
+            for r in rects:
+                if r['layer'] not in ROUTE_LAYERS:
+                    continue
+                rect = _transform_rect(tr, r['rect'])
+                for pt in _sample_rect_points(rect, r['layer']):
                     pin.add(pt)
-                if net in params:
-                    boundary_nets.add(net)
-            else:
-                obstacles.setdefault(layer, []).append(rect)
+            if net in params:
+                boundary_nets.add(net)
+        # blockages: shapes in the raw leaf json with no pin name
+        for term in blockages.get(ctn, []):
+            if (term.get('pin') or term.get('netName')) is not None:
+                continue
+            layer = term['layer']
+            if layer in ROUTE_LAYERS:
+                obstacles.setdefault(layer, []).append(
+                    _transform_rect(tr, term['rect']))
     return net_pins, obstacles, boundary_nets
 
 
@@ -138,7 +149,8 @@ def _boundary_pin_for(net, pins, bbox):
 
 def detail_route_module(module, leaf_collateral, pdk_json,
                         wire_guides=None, backend='sat',
-                        n_workers=None, solver_kw=None):
+                        n_workers=None, solver_kw=None,
+                        input_dir=None):
     """Route one placed module.
 
     Returns ``(terminals, report)`` where ``terminals`` is a list of
@@ -149,7 +161,7 @@ def detail_route_module(module, leaf_collateral, pdk_json,
     grid = RoutingGrid(bbox, metal_infos, via_infos)
 
     net_pins, obstacles, boundary_nets = collect_nets_and_obstacles(
-        module, leaf_collateral)
+        module, leaf_collateral, input_dir=input_dir)
 
     # every net gets an edge-escape pin so power/ground rails and
     # top-level ports both terminate at the die boundary
