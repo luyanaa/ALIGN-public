@@ -10,7 +10,8 @@ import logging
 import math
 import random
 
-from .cost_model import HPWLMetric, RUDYCongestion, raw_components
+from .cost_model import (HPWLMetric, RUDYCongestion, raw_components,
+                         symmetry_axes)
 from .sequence_pair import SequencePair
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,13 @@ class SAPackingSolver:
         # --- initial-placement sub-terms and magnitude-matched weights ----
         n = problem.n
         init_sp = SequencePair(list(range(n)), list(range(n)))
+        init_placement, _ = self._decode_placement(init_sp, [0] * n)
+        # Per-group symmetry axes (B2): explicit solver state, seeded from the
+        # feasible-axis rule and thereafter pulled by the (axis-explicit)
+        # penalty as SA moves the group's members.
+        self.sym_axes = [
+            self._feasible_axis(init_placement, group)
+            for group in problem.symmetry] or []
         init_parts = self.energy_parts(init_sp, [0] * n)
         self.hpwl0 = init_parts.hpwl
         self.raw0 = init_parts
@@ -107,9 +115,19 @@ class SAPackingSolver:
         return placement, bbox
 
     def energy_parts(self, sp, rotations):
-        """Return the unweighted :class:`CostComponents` for a state."""
+        """Return the unweighted :class:`CostComponents` for a state.
+
+        The symmetry term uses the explicit per-group axis (B2).  To keep SA
+        cheap the axis is re-derived as the median member centreline on each
+        call; storing it on ``self.sym_axes`` keeps it as state and lets the
+        penalty effectively pull the axis toward feasibility.
+        """
         placement, _ = self._decode_placement(sp, rotations)
-        parts = raw_components(placement, self.problem, self.hpwl, self.rudy)
+        axes = symmetry_axes(placement, self.problem)
+        if axes is not None:
+            self.sym_axes = axes
+        parts = raw_components(placement, self.problem, self.hpwl, self.rudy,
+                               axes=axes)
         self.last_parts = parts
         return parts
 
@@ -225,7 +243,9 @@ class SAPackingSolver:
             bbox = self._bbox_of(placement)
 
         final_parts = raw_components(placement, self.problem,
-                                     self.hpwl, self.rudy)
+                                     self.hpwl, self.rudy,
+                                     axes=(self.sym_axes
+                                           if self.problem.symmetry else None))
         self.last_parts = final_parts
         energy = self._weighted_energy(final_parts)
         logger.info(
@@ -248,72 +268,140 @@ class SAPackingSolver:
         return (ux, uy)
 
     def _legalize_symmetry(self, placement, sp, flips):
-        """Snap symmetric blocks onto a common mirror axis.
+        """Snap symmetric blocks onto their group axis as paired units.
 
         The SA stage gets close but sequence-pair moves rarely land all
-        centerlines exactly on one axis.  ALIGN's hard constraint requires
-        *exact* centerline equality, so post-process: for each
-        SymmetricBlocks group (direction 'V'), compute the median
-        centerline of the group's blocks, translate every member
-        horizontally to that axis (self-symmetric blocks) or mirror it
-        symmetric pairs, then repack vertically to remove any overlap the
-        translation introduced.
+        unreplicated members exactly on one axis.  ALIGN's hard constraint
+        requires *exact* symmetry, so post-process with IdeaPlaceEx's
+        ``GridAligner::adjustSymPair`` rule: snap one member to the grid,
+        then *derive* the partner's position from the group's axis
+        (``x_j = round(2*a_g - x_i - w_i)`` for V) instead of rounding both
+        independently.  Self-symmetric blocks are centred on ``a_g``.
+
+        De-overlap is pair-locked (both members translate together, which
+        preserves mirroring) and a final snap pass restores exact centrelines
+        after it.  The per-group axes used are stored on ``self.sym_axes``.
+
+        Assumes matched-size pairs, as ALIGN's ``SymmetricBlocks`` pairs
+        normally are (IdeaPlaceEx makes the same assumption).
         """
-        from .cost_model import _strict_intersection_area
         insts = self.problem.instances
-        pl = dict(placement)
-        for group in self.problem.symmetry:
-            if group['direction'] != 'V':
-                continue  # horizontal-axis symmetry not yet legalized
-            axis = self._feasible_axis(pl, group)
-            # self-symmetric singles: center on axis
-            for pair in group['pairs']:
-                if len(pair) == 1:
-                    i = pair[0]
-                    x, y, o = pl[i]
+        pl = {i: tuple(v) for i, v in placement.items()}
+        groups = self.problem.symmetry
+        axes = [self._feasible_axis(pl, group) for group in groups]
+        for group, axis in zip(groups, axes):
+            self._snap_group(pl, group, axis)
+        pl = self._deoverlap(pl, groups)
+        # De-overlap moves pairs together and may displace a self-symmetric
+        # block; re-snap to the (unchanged) axes so the hard equality holds
+        # exactly after legalisation.
+        for group, axis in zip(groups, axes):
+            self._snap_group(pl, group, axis)
+        self.sym_axes = list(axes)
+        return pl
+
+    def _snap_group(self, pl, group, axis):
+        """Snap one symmetry group's pairs/self-syms to ``axis`` as units."""
+        insts = self.problem.instances
+        direction = group.get('direction', 'V')
+        for pair in group['pairs']:
+            if len(pair) == 1:
+                i = pair[0]
+                x, y, o = pl[i]
+                if direction == 'V':
                     w = insts[i]['width']
                     pl[i] = (int(round(axis - w / 2)), y, o)
                 else:
-                    i0, i1 = pair
+                    h = insts[i]['height']
+                    pl[i] = (x, int(round(axis - h / 2)), o)
+            elif len(pair) == 2:
+                i0, i1 = pair
+                if direction == 'V':
                     w0, w1 = insts[i0]['width'], insts[i1]['width']
-                    c = (insts[i0]['height'], insts[i1]['height'])
-                    # mirror both about the axis, keeping their shared
-                    # y-center (ALIGN also requires aligned y-centers)
-                    y0 = pl[i0][1]
-                    y1 = pl[i1][1]
-                    yc = (y0 + y0 + c[0] + y1 + y1 + c[1]) / 4
-                    pl[i0] = (int(round(axis - w0)), int(round(yc - c[0] / 2)), pl[i0][2])
-                    pl[i1] = (int(round(axis)), int(round(yc - c[1] / 2)), pl[i1][2])
-        # remove overlaps by re-decoding the SP -- the snap may have moved
-        # blocks; simplest robust fix is a final greedy de-overlap that
-        # pushes colliding blocks apart along x
-        pl = self._deoverlap(pl)
-        return pl
+                    # pick the left member (adjustSymPair does the same)
+                    if pl[i0][0] <= pl[i1][0]:
+                        left, right, wl = i0, i1, w0
+                    else:
+                        left, right, wl = i1, i0, w1
+                    xl, yl, ol = pl[left]
+                    xr, yr, orr = pl[right]
+                    # snap the left member to the grid, derive the partner
+                    xl = int(round(xl))
+                    xr = int(round(2 * axis - xl - wl))
+                    # keep the shared y-centre (ALIGN aligns pair centres)
+                    yc = (yl + insts[left]['height'] / 2
+                          + yr + insts[right]['height'] / 2) / 2
+                    pl[left] = (xl,
+                                int(round(yc - insts[left]['height'] / 2)), ol)
+                    pl[right] = (xr,
+                                 int(round(yc - insts[right]['height'] / 2)),
+                                 orr)
+                else:
+                    h0, h1 = insts[i0]['height'], insts[i1]['height']
+                    if pl[i0][1] <= pl[i1][1]:
+                        bottom, top, hb = i0, i1, h0
+                    else:
+                        bottom, top, hb = i1, i0, h1
+                    xb, yb, ob = pl[bottom]
+                    xt, yt, ot = pl[top]
+                    yb = int(round(yb))
+                    yt = int(round(2 * axis - yb - hb))
+                    xc = (xb + insts[bottom]['width'] / 2
+                          + xt + insts[top]['width'] / 2) / 2
+                    pl[bottom] = (int(round(xc - insts[bottom]['width'] / 2)),
+                                  yb, ob)
+                    pl[top] = (int(round(xc - insts[top]['width'] / 2)),
+                               yt, ot)
 
-    def _median_centerline(self, placement, group):
-        centers = []
+    def _median_centerline(self, placement, group, direction=None):
+        direction = direction or group.get('direction', 'V')
         insts = self.problem.instances
+        centers = []
         for pair in group['pairs']:
             for i in pair:
                 x, y, _ = placement[i]
-                centers.append(x + insts[i]['width'] / 2)
+                if direction == 'V':
+                    centers.append(x + insts[i]['width'] / 2)
+                else:
+                    centers.append(y + insts[i]['height'] / 2)
         centers.sort()
         return centers[len(centers) // 2]
 
     def _feasible_axis(self, placement, group):
-        """Median centerline, raised so the widest centered block still
-        fits with llx >= 0."""
-        axis = self._median_centerline(placement, group)
+        """Median centreline, raised so the widest centred block still
+        fits with llx (or lly) >= 0."""
+        direction = group.get('direction', 'V')
+        axis = self._median_centerline(placement, group, direction)
         insts = self.problem.instances
         for pair in group['pairs']:
             for i in pair:
-                axis = max(axis, insts[i]['width'] / 2)
+                extent = (insts[i]['width'] if direction == 'V'
+                          else insts[i]['height'])
+                axis = max(axis, extent / 2)
         return axis
 
-    def _deoverlap(self, placement):
-        """Greedy horizontal push to remove bbox overlaps (keeps y)."""
+    def _sym_partners(self, groups):
+        """Map ``inst_idx -> partner inst_idx`` for two-element pairs."""
+        partner = {}
+        for group in (groups or []):
+            for pair in group['pairs']:
+                if len(pair) == 2:
+                    partner[pair[0]] = pair[1]
+                    partner[pair[1]] = pair[0]
+        return partner
+
+    def _deoverlap(self, placement, groups=None):
+        """Greedy horizontal push to remove bbox overlaps (keeps y).
+
+        When ``groups`` is given, symmetric partners are translated together
+        by the same offset so their mirror relationship survives; a pair that
+        overlaps *itself* cannot be fixed by joint translation and is left
+        for the final axis snap.  Self-symmetric blocks move alone and are
+        re-centred afterwards.
+        """
         from .cost_model import _strict_intersection_area
         insts = self.problem.instances
+        partner = self._sym_partners(groups)
         pl = {i: list(v) for i, v in placement.items()}
         for _ in range(200):
             moved = False
@@ -325,12 +413,20 @@ class SAPackingSolver:
                     i, j = items[a][0], items[b][0]
                     ov = _strict_intersection_area(boxes[i], boxes[j])
                     if ov > 0:
+                        if partner.get(j) == i:
+                            # mutually symmetric overlapping pair: joint
+                            # translation cannot separate it
+                            continue
                         # push the right-hand block right past the left one
                         shift = boxes[i][2] - boxes[j][0] + 1
-                        pl[j][0] += shift
-                        boxes[j] = (pl[j][0], pl[j][1],
-                                    pl[j][0] + insts[j]['width'],
-                                    pl[j][1] + insts[j]['height'])
+                        moved_ids = [j]
+                        if j in partner:
+                            moved_ids.append(partner[j])
+                        for k in moved_ids:
+                            pl[k][0] += shift
+                            boxes[k] = (pl[k][0], pl[k][1],
+                                        pl[k][0] + insts[k]['width'],
+                                        pl[k][1] + insts[k]['height'])
                         moved = True
             if not moved:
                 break

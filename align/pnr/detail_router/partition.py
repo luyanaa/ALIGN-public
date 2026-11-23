@@ -101,7 +101,14 @@ def partition_nets(net_pins, grid, max_region_nets=20, margin=None):
 def _solve_one(args):
     """Worker: build candidates + solve one region.  Runs in a child
     process; must be picklable, so everything it needs is passed in."""
-    region_nets, grid, guide_map, backend, solver_kw, bnd, prects = args
+    region_nets, grid, guide_map, backend, solver_kw, bnd, prects, \
+        reserve = args
+    if reserve:
+        # pin rects of nets that are *not* being routed here but whose
+        # metal must still be respected (symmetric mirror partners).
+        prects = dict(prects)
+        for net, rects in reserve.items():
+            prects.setdefault(net, rects)
     cands = build_region_candidates(region_nets, grid, guide_map,
                                     boundary_pins=bnd,
                                     pin_rects=prects)
@@ -126,14 +133,17 @@ def _solve_one(args):
 def route_parallel(net_pins, grid, guide_map=None, backend='sat',
                    solver_kw=None, n_workers=None,
                    max_region_nets=20, boundary_pins=None,
-                   pin_rects=None):
+                   pin_rects=None, reserve_pin_rects=None):
     """Route all nets, partitioned into regions solved in parallel.
 
     ``boundary_pins`` is ``{net: pin_index}`` marking the synthetic
     die-edge escape pin each net may carry; it is forwarded to the
     candidate builder so those pins are not reserved as foreign
     blockages.  ``pin_rects`` is ``{net: [{layer:[rect]}]}`` used for
-    precise pin-attachment overlap tests.
+    precise pin-attachment overlap tests.  ``reserve_pin_rects`` is an
+    extra ``{net: [...]}`` map of pin metal that is *not* routed here
+    but must still be respected (a symmetric mirror partner whose pins
+    stay real while its wires are derived).
 
     Returns ``{net: [CandidatePath]}`` or ``None`` on any region
     failure.
@@ -144,9 +154,10 @@ def route_parallel(net_pins, grid, guide_map=None, backend='sat',
         return {}
     bnd = boundary_pins or {}
     prects = pin_rects or {}
+    reserve = reserve_pin_rects or {}
     args = [(r, grid, guide_map or {}, backend, solver_kw,
              {n: i for n, i in bnd.items() if n in r},
-             {n: prects[n] for n in r if n in prects})
+             {n: prects[n] for n in r if n in prects}, reserve)
             for r in regions]
     if len(regions) == 1 or n_workers == 1:
         results = [_solve_one(a) for a in args]

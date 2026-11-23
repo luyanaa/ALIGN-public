@@ -182,3 +182,57 @@ def test_adaptive_weights_beat_fixed_weight_on_symmetry():
     # violation-driven growth is real, and it lowers the raw violation
     assert adaptive.w_sym > adaptive.w_sym_init
     assert (symmetry_penalty(a_pl, p) <= symmetry_penalty(f_pl, p) + 1e-9)
+
+
+def test_symmetry_penalty_axis_explicit_matches_legacy_at_reference():
+    """Axis-explicit penalty equals the legacy penalty when the axis is the
+    legacy first-pair reference centreline."""
+    p = symmetric_problem()
+    placement = {
+        0: (0, 0, 0), 1: (40, 5, 0),
+        2: (3, 30, 0), 3: (37, 30, 0),
+        4: (5, 60, 0), 5: (43, 60, 0),
+        6: (7, 90, 0), 7: (41, 90, 0),
+    }
+    first = p.symmetry[0]['pairs'][0]
+    centres = [(placement[i][0] + p.instances[i]['width'] / 2)
+               for i in first]
+    ref_axis = sum(centres) / len(centres)
+    legacy = symmetry_penalty(placement, p)
+    aware = symmetry_penalty(placement, p, axes=[ref_axis])
+    assert abs(aware - legacy) < 1e-9
+
+
+def test_legalize_snaps_pairs_exactly_mirrored_about_axis():
+    """B2: legalisation snaps symmetric pairs *as a unit*, deriving the
+    partner from the group axis, so centreline-sums match the axis exactly
+    (to integer rounding) and the axis is the feasible axis."""
+    p = symmetric_problem()
+    solver = SAPackingSolver(p, seed=0, n_steps=5)
+    # a deliberately asymmetric, overlapping placement
+    placement = {
+        0: (0, 0, 0), 1: (41, 3, 0),
+        2: (2, 30, 0), 3: (36, 29, 0),
+        4: (4, 60, 0), 5: (44, 63, 0),
+        6: (6, 90, 0), 7: (40, 92, 0),
+    }
+    expected_axes = [solver._feasible_axis(placement, g)
+                     for g in p.symmetry]
+    out = solver._legalize_symmetry(placement, None, None)
+
+    # axis state equals the feasible-axis rule applied to the input
+    assert solver.sym_axes == expected_axes
+    assert solver.sym_axes == [solver._feasible_axis(placement, g)
+                               for g in p.symmetry]
+
+    for group, axis in zip(p.symmetry, solver.sym_axes):
+        for pair in group['pairs']:
+            if len(pair) == 1:
+                i = pair[0]
+                cl = 2 * out[i][0] + p.instances[i]['width']
+                assert abs(cl - 2 * axis) <= 1
+            else:
+                i, j = pair
+                cl = ((2 * out[i][0] + p.instances[i]['width'])
+                      + (2 * out[j][0] + p.instances[j]['width']))
+                assert abs(cl - 4 * axis) <= 1

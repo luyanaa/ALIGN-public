@@ -158,6 +158,231 @@ def _boundary_pin_for(net, pins, bbox):
     return {(cx, y0 if edge == 'S' else y1, 'M4')}
 
 
+def find_symmetric_net_pairs(module):
+    """Return ``[(net1, net2, direction), ...]`` from the module's
+    ``SymmetricNets`` constraints.  Only vertical-axis pairs (``V``) are
+    currently useful to this router: the mirror is a reflection in x.
+    """
+    pairs = []
+    for c in module.get('constraints', []):
+        if c.get('constraint') != 'SymmetricNets':
+            continue
+        n1, n2 = c.get('net1'), c.get('net2')
+        if not n1 or not n2 or n1 == n2:
+            continue
+        pairs.append((n1, n2, c.get('direction', 'V')))
+    return pairs
+
+
+def _instance_center_x(inst, leaf_collateral):
+    """Physical x-centre of a placed instance, or ``None`` if unknown."""
+    if inst is None:
+        return None
+    leaf = leaf_collateral.get(inst.get('concrete_template_name'))
+    if not leaf or 'bbox' not in leaf:
+        return None
+    b = leaf['bbox']
+    tr = inst['transformation']
+    x0 = tr['sX'] * b[0] + tr['oX']
+    x1 = tr['sX'] * b[2] + tr['oX']
+    return (x0 + x1) / 2.0
+
+
+def derive_symmetry_axis_x(module, leaf_collateral, bbox):
+    """Derive the vertical mirror axis (an x coordinate).
+
+    Preference order:
+      1. ``SymmetricBlocks`` with direction ``V``: a self-symmetric
+         single block sits centred on the axis; a paired block's axis is
+         the midpoint of the two instance centres.  Median over groups
+         (robust against a stray self-symmetric block).
+      2. The module bbox vertical centreline.
+      3. ``None`` (symmetry disabled).
+    """
+    by_name = {inst['instance_name']: inst
+               for inst in module.get('instances', [])}
+    estimates = []
+    for c in module.get('constraints', []):
+        if c.get('constraint') != 'SymmetricBlocks':
+            continue
+        if c.get('direction', 'V') != 'V':
+            continue
+        for pair in c.get('pairs', []):
+            centres = [_instance_center_x(by_name.get(name), leaf_collateral)
+                       for name in pair]
+            centres = [c for c in centres if c is not None]
+            if len(pair) == 1 and centres:
+                estimates.append(centres[0])
+            elif len(pair) == 2 and len(centres) == 2:
+                estimates.append((centres[0] + centres[1]) / 2.0)
+    if estimates:
+        estimates.sort()
+        return int(round(estimates[len(estimates) // 2]))
+    if bbox:
+        return (bbox[0] + bbox[2]) // 2
+    return None
+
+
+def mirror_rect_x(rect, axis_x):
+    """Reflect a rect in the vertical line ``x == axis_x``.
+
+    The image of ``[x0, x1]`` is ``[2*axis - x1, 2*axis - x0]`` -- the
+    endpoints swap roles so ``x0 < x1`` is preserved."""
+    x0, y0, x1, y1 = rect
+    nx0 = int(round(2 * axis_x - x1))
+    nx1 = int(round(2 * axis_x - x0))
+    return [min(nx0, nx1), y0, max(nx0, nx1), y1]
+
+
+def _resolve_net(name, net_pins):
+    """Case-insensitive net lookup (constraints are upper-cased)."""
+    if name in net_pins:
+        return name
+    up = name.upper()
+    for net in net_pins:
+        if net.upper() == up:
+            return net
+    return None
+
+
+def _rects_overlap(a, b):
+    """Closed-rect overlap: boundary contact counts (a short)."""
+    return not (a[2] < b[0] or b[2] < a[0]
+                or a[3] < b[1] or b[3] < a[1])
+
+
+def _mirror_is_legal(partner, mirrored, existing, net_pins, bbox, tol=0):
+    """Re-check a mirrored terminal set before committing to it.
+
+    * every rect lies inside the die bbox (an overhang no larger than
+      ``tol`` is allowed: an edge-escape via legitimately overhangs the
+      die by half a wire width, on the primary side too),
+    * no rect overlaps a foreign net's terminal on the same layer,
+    * every partner pin is touched by a mirrored terminal,
+    * the mirrored terminals form one connected component.
+
+    Returns ``(ok, reason)``.
+    """
+    from .validate import check_connectivity, check_pin_coverage
+
+    for t in mirrored:
+        x0, y0, x1, y1 = t['rect']
+        if (x0 < bbox[0] - tol or y0 < bbox[1] - tol
+                or x1 > bbox[2] + tol or y1 > bbox[3] + tol):
+            return False, 'outside die bbox'
+    for t in mirrored:
+        for e in existing:
+            if e['netName'] == partner:
+                continue
+            if e['layer'] == t['layer'] and \
+                    _rects_overlap(t['rect'], e['rect']):
+                return False, f"overlaps {e['netName']} on {t['layer']}"
+    if check_pin_coverage(mirrored, {partner: net_pins.get(partner, [])}):
+        return False, 'does not reach partner pins'
+    comps = check_connectivity(mirrored)
+    if comps.get(partner, 0) != 1:
+        return False, f"partner has {comps.get(partner)} components"
+    return True, ''
+
+
+def _route_with_symmetry(net_pins, grid, bbox, guide_map, backend,
+                         n_workers, solver_kw, boundary_pins,
+                         net_pin_rects, sym_pairs, axis_x,
+                         leaf_collateral, module, input_dir):
+    """Try to route only the primary net of each symmetric pair and
+    mirror its terminal set into the partner.
+
+    Returns ``(terminals, report)`` on success or ``None`` to signal the
+    caller to fall back to the completely normal (non-symmetric) route.
+    Any infeasibility degrades the whole attempt, so the normal path
+    stays byte-for-byte unchanged.
+    """
+    active = []
+    partners = set()
+    for n1_name, n2_name, direction in sym_pairs:
+        if direction != 'V':
+            logger.info('symmetric pair %s/%s is %s-axis; not supported',
+                        n1_name, n2_name, direction)
+            continue
+        n1 = _resolve_net(n1_name, net_pins)
+        n2 = _resolve_net(n2_name, net_pins)
+        if n1 is None or n2 is None or n1 == n2:
+            continue
+        if n1 in partners or n2 in partners:
+            continue  # keep pairs disjoint (safety cap)
+        if n1 not in net_pins or n2 not in net_pins:
+            continue
+        active.append((n1, n2))
+        partners.add(n2)
+    if not active:
+        return None
+
+    route_pins = {n: p for n, p in net_pins.items() if n not in partners}
+    if not route_pins:
+        return None
+    route_bnd = {n: i for n, i in boundary_pins.items()
+                 if n not in partners}
+    route_rects = {n: r for n, r in net_pin_rects.items()
+                   if n not in partners}
+    reserve_rects = {n: net_pin_rects[n] for n in partners
+                     if n in net_pin_rects}
+    # the partners are not routed normally, but their real pin metal is
+    # still foreign to every mirrored net
+    partner_pin_terms = pin_terminals(
+        net_pins, {n2: True for _, n2 in active}, grid,
+        leaf_collateral, module, input_dir)
+
+    selected = route_parallel(
+        route_pins, grid, guide_map, backend=backend,
+        n_workers=n_workers, solver_kw=solver_kw,
+        boundary_pins=route_bnd, pin_rects=route_rects,
+        reserve_pin_rects=reserve_rects)
+    if selected is None:
+        logger.info('symmetry attempt: primary-side routing failed')
+        return None
+
+    terminals = paths_to_terminals(selected, grid)
+    terminals += pin_terminals(net_pins, selected, grid, leaf_collateral,
+                               module, input_dir)
+
+    mirrored_pairs = []
+    tol = max((m.width for m in grid.metal_list), default=0) // 2
+    for n1, n2 in active:
+        if n1 not in selected:
+            logger.info('symmetry attempt: primary net %s unrouted', n1)
+            return None
+        mirrored = [dict(t) for t in
+                    paths_to_terminals({n1: selected[n1]}, grid)]
+        for t in mirrored:
+            t['netName'] = n2
+            t['rect'] = mirror_rect_x(t['rect'], axis_x)
+            t['mirroredFrom'] = n1
+        # partner's *real* pin metal (not a mirror): the placement
+        # decides where the partner's pins actually are
+        mirrored += pin_terminals(net_pins, {n2: True}, grid,
+                                  leaf_collateral, module, input_dir)
+        ok, reason = _mirror_is_legal(
+            n2, mirrored, terminals + partner_pin_terms,
+            net_pins, bbox, tol)
+        if not ok:
+            logger.info('symmetry attempt: mirroring %s -> %s rejected '
+                        '(%s); routing normally', n1, n2, reason)
+            return None
+        terminals.extend(mirrored)
+        mirrored_pairs.append([n1, n2])
+
+    report = {
+        'status': 'ok',
+        'nets': len(selected) + len(mirrored_pairs),
+        'terminals': len(terminals),
+        'symmetric': {
+            'axis_x': axis_x,
+            'mirrored_pairs': mirrored_pairs,
+        },
+    }
+    return terminals, report
+
+
 def detail_route_module(module, leaf_collateral, pdk_json,
                         wire_guides=None, backend='sat',
                         n_workers=None, solver_kw=None,
@@ -214,6 +439,25 @@ def detail_route_module(module, leaf_collateral, pdk_json,
         for w in wire_guides:
             guide_map.setdefault(w['net'], []).append(
                 (w['layer'], tuple(w['rect'])))
+
+    # Symmetric-net routing (A3): route the primary net of each
+    # SymmetricNets pair, then mirror its wire/via set into the partner.
+    # Gated on (a) at least one explicit pair and (b) a derivable axis;
+    # any failure falls through to the unchanged normal route below.
+    sym_pairs = find_symmetric_net_pairs(module)
+    if sym_pairs:
+        axis_x = derive_symmetry_axis_x(module, leaf_collateral, bbox)
+        if axis_x is not None:
+            attempt = _route_with_symmetry(
+                net_pins, grid, bbox, guide_map, backend, n_workers,
+                solver_kw or {}, boundary_pins, net_pin_rects,
+                sym_pairs, axis_x, leaf_collateral, module, input_dir)
+            if attempt is not None:
+                return attempt
+            logger.info('symmetric-net mirror routing degraded; '
+                        'using normal routing for every net')
+        else:
+            logger.info('no symmetry axis derivable; symmetry disabled')
 
     selected = route_parallel(net_pins, grid, guide_map,
                               backend=backend, n_workers=n_workers,

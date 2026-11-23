@@ -11,7 +11,11 @@ from align.pnr.detail_router.candidates import (CandidateGenerator,
                                                 build_region_candidates)
 from align.pnr.detail_router.constraints import build_problem
 from align.pnr.detail_router.driver import (_transform_rect,
-                                            collect_nets_and_obstacles)
+                                            collect_nets_and_obstacles,
+                                            derive_symmetry_axis_x,
+                                            find_symmetric_net_pairs,
+                                            mirror_rect_x)
+from align.pnr.detail_router.validate import validate
 from align.pnr.detail_router.solver_sat import sat_available, \
     solve_region as solve_sat
 from align.pnr.detail_router.solver_mip import mip_available, \
@@ -305,3 +309,87 @@ def test_ftota_mip_routes_all_nets():
         _ftota_module(), _collateral(), pdk, backend='mip', n_workers=1,
         input_dir=E2E / '3_pnr/inputs')
     assert report['status'] == 'ok'
+
+
+# -- A3: symmetric-net mirror routing ----------------------------------------
+
+def test_mirror_rect_x():
+    # endpoints swap so x0 < x1 is preserved
+    assert mirror_rect_x((10, 5, 30, 9), 50) == [70, 5, 90, 9]
+    assert mirror_rect_x((0, 0, 0, 0), 500) == [1000, 0, 1000, 0]
+
+
+def _symmetric_module():
+    """Two net pairs placed exactly mirror-symmetric about x = 500.
+
+    N1 uses the left instances, N2 the right ones.  Each instance has a
+    single ``P`` pin on M2; the leaf is identical on both sides.
+    """
+    def inst(name, ox, oy, net, sX=1):
+        return {
+            'instance_name': name,
+            'concrete_template_name': 'CELL',
+            'transformation': {'oX': ox, 'oY': oy, 'sX': sX, 'sY': 1},
+            'fa_map': [{'formal': 'P', 'actual': net}],
+        }
+    return {
+        'bbox': [0, 0, 1000, 1000],
+        'parameters': [],
+        'constraints': [
+            {'constraint': 'SymmetricBlocks', 'direction': 'V',
+             'pairs': [['L1', 'R1'], ['L2', 'R2']]},
+            {'constraint': 'SymmetricNets', 'direction': 'V',
+             'net1': 'N1', 'net2': 'N2'},
+        ],
+        'instances': [
+            inst('L1', 100, 100, 'N1'),
+            inst('R1', 900, 100, 'N2', sX=-1),
+            inst('L2', 100, 700, 'N1'),
+            inst('R2', 900, 700, 'N2', sX=-1),
+        ],
+    }
+
+
+_SYM_LEAF = {
+    'CELL': {
+        'bbox': [0, 0, 200, 200],
+        'terminals': {'P': [{'layer': 'M2',
+                             'rect': [40, 80, 120, 120]}]},
+    }
+}
+
+
+def test_find_symmetric_pairs_and_axis():
+    m = _symmetric_module()
+    assert find_symmetric_net_pairs(m) == [('N1', 'N2', 'V')]
+    assert derive_symmetry_axis_x(m, _SYM_LEAF, tuple(m['bbox'])) == 500
+
+
+@pytest.mark.skipif(not sat_available(), reason='python-sat missing')
+@pytest.mark.skipif(not DATA.is_dir(), reason='mock PDK missing')
+def test_symmetric_mirror_routes_partner():
+    """N1 routes; N2's terminals are the exact geometric mirror, and
+    both nets validate as connected."""
+    from align.pnr.detail_router.driver import detail_route_module
+    pdk = json.loads((DATA / 'layers.json').read_text())
+    terminals, report = detail_route_module(
+        _symmetric_module(), _SYM_LEAF, pdk, backend='sat', n_workers=1)
+    assert report['status'] == 'ok'
+    assert report['symmetric']['axis_x'] == 500
+    assert report['symmetric']['mirrored_pairs'] == [['N1', 'N2']]
+
+    n1 = [t for t in terminals if t['netName'] == 'N1']
+    n2_mirrored = [t for t in terminals if t['netName'] == 'N2'
+                   and t.get('mirroredFrom') == 'N1']
+    assert n1 and n2_mirrored
+    # every N1 routed rect has an exact mirror image in N2
+    n1_rects = {(t['layer'], tuple(t['rect'])) for t in n1}
+    for t in n2_mirrored:
+        src = mirror_rect_x(t['rect'], 500)     # involution
+        assert (t['layer'], tuple(src)) in n1_rects, (t['layer'], src)
+
+    rep = validate(terminals)
+    assert rep['components'].get('N1') == 1
+    assert rep['components'].get('N2') == 1
+    assert rep['ok'] is True
+

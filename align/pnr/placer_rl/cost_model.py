@@ -160,15 +160,63 @@ def overlap_area(placement, problem):
     return area
 
 
-def symmetry_penalty(placement, problem):
+def group_axis(placement, problem, group):
+    """Median centreline of one symmetry group (the explicit axis ``a_g``).
+
+    IdeaPlaceEx models the mirror axis as a decision variable; we keep the
+    same notion -- a per-group axis in *true centreline* units -- but derive
+    it cheaply from the current placement (median of the member centrelines
+    along the mirror direction).  Deriving it inside the energy keeps SA
+    cheap while still letting the penalty pull the placement (and therefore
+    the axis) toward feasibility, since translating a group shifts its
+    median.
+
+    Direction 'V' mirrors about a vertical axis (x centreline); 'H' about a
+    horizontal one (y centreline).
+    """
+    direction = group.get('direction', 'V')
+    centers = []
+    for pair in group['pairs']:
+        for i in pair:
+            x, y, _ = placement[i]
+            if direction == 'V':
+                centers.append(x + problem.instances[i]['width'] / 2)
+            else:
+                centers.append(y + problem.instances[i]['height'] / 2)
+    if not centers:
+        return 0.0
+    centers.sort()
+    return centers[len(centers) // 2]
+
+
+def symmetry_axes(placement, problem):
+    """Per-group derived axis (``None`` when the problem has no symmetry)."""
+    sym = getattr(problem, 'symmetry', None)
+    if not sym:
+        return None
+    return [group_axis(placement, problem, group) for group in sym]
+
+
+def symmetry_penalty(placement, problem, axes=None):
     """Squared violation of the module's ``SymmetricBlocks`` constraints.
 
     Mirrors the semantics of ``align.schema.constraint.SymmetricBlocks``:
     for direction 'V' (vertical mirror axis) every pair contributes the
     x-coordinates of its centerline; self-symmetric single instances count
-    their own centerline.  All pairs must share the same centerline
-    ``reference``, and paired (non-self) blocks must additionally align
+    their own centerline.  Paired (non-self) blocks must additionally align
     their perpendicular centerline within a quarter of the block height.
+
+    Axis handling (B2):
+
+    * ``axes is None`` -- legacy/backward-compatible behaviour: the group's
+      first pair defines the reference centerline-sum, exactly as before.
+    * ``axes`` supplied -- one explicit axis ``a_g`` per group (index-aligned
+      with ``problem.symmetry``; a ``None`` entry is derived with
+      :func:`group_axis`).  Each pair is measured against its group axis:
+      the pair's centerline sum (``2 * centre`` per member) must equal
+      ``2 * len(pair) * a_g``, e.g. ``(x_i+w_i) + (x_j+w_j) = 4*a_g`` for a
+      two-element V pair -- IdeaPlaceEx's ``x_i + x_j + w = 2a`` form,
+      doubled to match this module's existing centerline-sum convention.
 
     The penalty is the squared L2 deviation so it scales like the HPWL
     term (quadratic in length units).  ``problem.symmetry`` is a list of
@@ -178,21 +226,33 @@ def symmetry_penalty(placement, problem):
     if not sym:
         return 0.0
     boxes = problem.placements_to_boxes(placement)
-    insts = problem.instances
     pen = 0.0
-    for group in sym:
+    for gidx, group in enumerate(sym):
         direction = group['direction']
-        ref = None
+        if axes is None:
+            axis = None
+            ref = None
+        else:
+            axis = axes[gidx]
+            if axis is None:
+                axis = group_axis(placement, problem, group)
+            ref = None
         for pair in group['pairs']:
-            # centerline sum along the mirror direction
+            # centerline sum along the mirror direction (2 * true centre
+            # per member, matching the original convention)
             cl = 0.0
             for idx in pair:
                 b = boxes[idx]
                 cl += (b[0] + b[2]) if direction == 'V' else (b[1] + b[3])
-            if ref is None:
-                ref = cl
+            if axis is None:
+                # legacy: first pair sets the reference
+                if ref is None:
+                    ref = cl
+                else:
+                    pen += (cl - ref) ** 2
             else:
-                pen += (cl - ref) ** 2
+                target = 2.0 * len(pair) * axis
+                pen += (cl - target) ** 2
             if len(pair) == 2:
                 # perpendicular centerlines must match within
                 # quarter-block-size of each block
@@ -236,12 +296,15 @@ class CostComponents:
     symmetry: float
 
 
-def raw_components(placement, problem, hpwl_metric=None, rudy_metric=None):
+def raw_components(placement, problem, hpwl_metric=None, rudy_metric=None,
+                   axes=None):
     """Return the four unweighted :class:`CostComponents` for ``placement``.
 
     ``hpwl_metric``/``rudy_metric`` may be supplied to reuse already-built
     metric objects (and their cached problem reference); otherwise they are
-    constructed here.
+    constructed here.  ``axes`` (one per symmetry group) selects the
+    axis-explicit symmetry penalty (B2); when omitted the symmetry term keeps
+    its legacy first-pair-reference behaviour.
     """
     hpwl_metric = hpwl_metric or HPWLMetric(problem)
     rudy_metric = rudy_metric or RUDYCongestion(problem, hpwl_metric)
@@ -249,7 +312,7 @@ def raw_components(placement, problem, hpwl_metric=None, rudy_metric=None):
         hpwl=hpwl_metric(placement),
         congestion=rudy_metric(placement),
         overlap=overlap_area(placement, problem),
-        symmetry=symmetry_penalty(placement, problem),
+        symmetry=symmetry_penalty(placement, problem, axes=axes),
     )
 
 
