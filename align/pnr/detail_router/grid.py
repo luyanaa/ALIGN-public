@@ -111,6 +111,18 @@ class RoutingGrid:
         self.allowed = {m.name: set() for m in metal_infos}
         self._init_free_cells()
 
+    def via_name(self, lower, upper):
+        """Name of the via layer bridging two adjacent metal layers."""
+        v = self.vias.get((lower, upper))
+        if v is not None:
+            return v.name
+        # fall back to V<lower-index> convention when the PDK does not
+        # name the via pair explicitly
+        try:
+            return f'V{int(lower[1:])}'
+        except (ValueError, IndexError):
+            return f'V{lower}_{upper}'
+
     # -- coordinate <-> index --------------------------------------------
     def track_index(self, layer, coord):
         """Index of the track nearest ``coord`` on the layer's cross axis."""

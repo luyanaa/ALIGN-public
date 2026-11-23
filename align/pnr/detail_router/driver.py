@@ -56,15 +56,19 @@ def collect_nets_and_obstacles(module, leaf_collateral,
     collect *blockage* shapes (terminals with no pin name) as routing
     obstacles.
 
-    Returns ``(net_pins, obstacles, boundary_nets)``:
+    Returns ``(net_pins, obstacles, boundary_nets, net_pin_rects)``:
       * ``net_pins``:    ``{net: [set-of-(x,y,layer) pts, ...]}`` -- one
         pin == one ``(instance, formal)`` pair
       * ``obstacles``:   ``{layer: [rect,...]}`` blockage shapes on
         routing layers (requires ``input_dir``)
       * ``boundary_nets``: set of nets that are top-level ports
+      * ``net_pin_rects``: ``{net: [{layer: [rect,...]}, ...]}`` -- the
+        actual transformed pin rectangles per logical pin, used for
+        precise access-cell overlap tests
     """
     params = set(module.get('parameters', []))
     net_pins = {}
+    net_pin_rects = {}
     pin_of = {}                     # (net, inst, formal) -> pin index
     obstacles = {}
     boundary_nets = set()
@@ -96,11 +100,14 @@ def collect_nets_and_obstacles(module, leaf_collateral,
             if key not in pin_of:
                 pin_of[key] = len(net_pins.setdefault(net, []))
                 net_pins[net].append(set())
+                net_pin_rects.setdefault(net, []).append({})
             pin = net_pins[net][pin_of[key]]
+            prects = net_pin_rects[net][pin_of[key]]
             for r in rects:
                 if r['layer'] not in ROUTE_LAYERS:
                     continue
                 rect = _transform_rect(tr, r['rect'])
+                prects.setdefault(r['layer'], []).append(rect)
                 for pt in _sample_rect_points(rect, r['layer']):
                     pin.add(pt)
             if net in params:
@@ -113,7 +120,7 @@ def collect_nets_and_obstacles(module, leaf_collateral,
             if layer in ROUTE_LAYERS:
                 obstacles.setdefault(layer, []).append(
                     _transform_rect(tr, term['rect']))
-    return net_pins, obstacles, boundary_nets
+    return net_pins, obstacles, boundary_nets, net_pin_rects
 
 
 def _sample_rect_points(rect, layer, n=3):
@@ -135,7 +142,11 @@ def _boundary_pin_for(net, pins, bbox):
     """Escort a net to the nearest die edge so it has an external
     connection point (top-level ports and power/ground rails both need
     one).  ``pins`` is a list of access-point *sets*; returns a new
-    single-point pin set."""
+    single-point pin set on M4.
+
+    The caller is responsible for de-conflicting the returned
+    coordinate against other nets' boundary pins (track quantisation
+    can collapse distinct centroids onto one track)."""
     x0, y0, x1, y1 = bbox
     pts = [pt for pin in pins for pt in pin]
     cx = sum(p[0] for p in pts) // len(pts)
@@ -160,14 +171,38 @@ def detail_route_module(module, leaf_collateral, pdk_json,
     bbox = tuple(module['bbox'])
     grid = RoutingGrid(bbox, metal_infos, via_infos)
 
-    net_pins, obstacles, boundary_nets = collect_nets_and_obstacles(
-        module, leaf_collateral, input_dir=input_dir)
+    net_pins, obstacles, boundary_nets, net_pin_rects = \
+        collect_nets_and_obstacles(module, leaf_collateral,
+                                   input_dir=input_dir)
 
     # every net gets an edge-escape pin so power/ground rails and
-    # top-level ports both terminate at the die boundary
+    # top-level ports both terminate at the die boundary.  Stagger pins
+    # that quantise to the same M4 track cell (different y coords can
+    # share a track); also record each boundary pin's index so the
+    # candidate builder knows not to reserve it as a foreign blockage.
+    taken_cells = set()
+    boundary_pins = {}
     for net in list(net_pins):
-        net_pins[net].append(
-            _boundary_pin_for(net, net_pins[net], bbox))
+        boundary_pins[net] = len(net_pins[net])
+        pin = _boundary_pin_for(net, net_pins[net], bbox)
+        (x, y, layer), = pin
+        # quantise the along-edge coordinate to its M4 track and bump it
+        # until no other boundary pin claims the same track cell
+        if x in (bbox[0], bbox[2]):     # W/E edge: y picks the track
+            ti = grid.track_index(layer, y)
+            while (x, ti) in taken_cells:
+                ti += 1
+            taken_cells.add((x, ti))
+            y = grid.track_coord(layer, ti)
+        else:                           # N/S edge: x picks the track
+            ti = grid.track_index(layer, x)
+            while (ti, y) in taken_cells:
+                ti += 1
+            taken_cells.add((ti, y))
+            x = grid.track_coord(layer, ti)
+        net_pins[net].append({(x, y, layer)})
+        net_pin_rects.setdefault(net, []).append(
+            {layer: [(x, y, x, y)]})
 
     # block obstacles on their layers
     for layer, rects in obstacles.items():
@@ -182,15 +217,70 @@ def detail_route_module(module, leaf_collateral, pdk_json,
 
     selected = route_parallel(net_pins, grid, guide_map,
                               backend=backend, n_workers=n_workers,
-                              solver_kw=solver_kw or {})
+                              solver_kw=solver_kw or {},
+                              boundary_pins=boundary_pins,
+                              pin_rects=net_pin_rects)
     if selected is None:
         return None, {'status': 'failed'}
 
     terminals = paths_to_terminals(selected, grid)
+    # emit the pin access shapes the router connected to, marked
+    # 'pin' like the C++ router -- they both document the attachment
+    # point and close the physical connectivity of a multi-access pin
+    terminals += pin_terminals(net_pins, selected, grid, leaf_collateral,
+                               module, input_dir)
     report = {'status': 'ok',
               'nets': len(selected),
               'terminals': len(terminals)}
     return terminals, report
+
+
+def pin_terminals(net_pins, selected_paths, grid, leaf_collateral,
+                  module, input_dir):
+    """Emit ``netType='pin'`` terminals for the leaf metal shapes that
+    the routed nets attach to.
+
+    The routed wires connect to a pin at one of its access points; the
+    pin's own metal (inside the leaf) is already connected, so echoing
+    the pin rect as a 'pin' terminal both documents the attachment and
+    lets downstream connectivity checks treat the pin as part of the
+    net's geometry.  We rebuild the rects from the raw ``<ctn>.json``
+    shapes for the formal pins the net maps to.
+    """
+    if input_dir is None:
+        return []
+    # (inst, formal) -> net, and the transformed pin rects per formal
+    formal_net = {}
+    pin_rects = {}
+    leaf_cache = {}
+    idir = pathlib.Path(input_dir)
+    for inst in module['instances']:
+        ctn = inst['concrete_template_name']
+        fa = {f['formal']: f['actual'] for f in inst['fa_map']}
+        if ctn not in leaf_cache:
+            fn = idir / f'{ctn}.json'
+            leaf_cache[ctn] = json.loads(fn.read_text()) \
+                if fn.is_file() else {'terminals': []}
+        for term in leaf_cache[ctn]['terminals']:
+            formal = term.get('pin') or term.get('netName')
+            if formal is None:
+                continue
+            net = fa.get(formal)
+            if net not in selected_paths:
+                continue
+            layer = term['layer']
+            if layer not in ROUTE_LAYERS:
+                continue
+            rect = _transform_rect(inst['transformation'], term['rect'])
+            key = (net, inst['instance_name'], formal)
+            pin_rects.setdefault(key, []).append((layer, rect))
+    out = []
+    for (net, inst_name, formal), items in pin_rects.items():
+        for layer, rect in items:
+            out.append({'netName': net, 'layer': layer,
+                        'rect': list(rect), 'netType': 'pin',
+                        'pin': f'{inst_name}/{formal}'})
+    return out
 
 
 def paths_to_terminals(selected_paths, grid):
@@ -211,22 +301,32 @@ def paths_to_terminals(selected_paths, grid):
                     terminals.append({
                         'netName': net,
                         'layer': piece.layer,
-                        'rect': _via_rect(grid, piece),
+                        'rect': list(piece.bbox)
+                        if piece.bbox else _via_rect(grid, piece),
                         'netType': 'drawing'})
     return terminals
 
 
 def _via_rect(grid, via_piece):
-    """Small square at the via cell center."""
-    xs, ys = [], []
+    """Small square at the via cell center.
+
+    ``via_piece.cells`` holds the metal cells the via touches; its
+    ``layer`` is the via layer name (``Vn``) which has no grid entry,
+    so derive geometry from the bridged metal cells.
+    """
+    xs, ys, ws = [], [], []
     for layer, ti, si in via_piece.cells:
         m = grid.metals[layer]
+        ws.append(m.width)
         if m.direction == 'V':
             xs.append(grid.track_coord(layer, ti))
             ys.append(grid.seg_coord(layer, si))
         else:
             ys.append(grid.track_coord(layer, ti))
             xs.append(grid.seg_coord(layer, si))
-    cx, cy = xs[0], ys[0]
-    w = min(m.width for m in grid.metal_list) // 2
+    # cells from different layers quantise to slightly different
+    # centres; average them so the via lands on the true junction
+    cx = sum(xs) // len(xs)
+    cy = sum(ys) // len(ys)
+    w = min(ws) // 2
     return [cx - w, cy - w, cx + w, cy + w]

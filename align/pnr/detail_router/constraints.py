@@ -54,21 +54,41 @@ class RegionProblem:
     def n_pins(self, net):
         return self._n_pins.get(net, 0)
 
+    @staticmethod
+    def _rects_touch(a, b):
+        """Closed-rectangle adjacency: boundaries count as contact."""
+        return not (a[2] < b[0] or b[2] < a[0]
+                    or a[3] < b[1] or b[3] < a[1])
+
     def build_mutexes(self, same_net_ok=True):
-        """Cell-sharing conflicts between paths of different nets."""
-        cell_map = defaultdict(list)
+        """Piece-geometry conflicts between paths of different nets.
+
+        Two paths conflict when any of their ``PathPiece`` rects share
+        a layer and geometrically touch (edge contact counts -- wires
+        on adjacent grid cells abut).  Pieces carry their *real* bboxes
+        (``_wire_bbox`` for runs, the true junction rect for vias), so
+        this test is far tighter than a cell-equality test: it no
+        longer flags paths whose cells merely quantise to neighbours,
+        while still catching genuine overlaps and end-to-end shorts.
+        """
+        # pieces per layer: [(rect, path_idx)]
+        by_layer = defaultdict(list)
         for i, p in enumerate(self.paths):
-            for cell in p.cells:
-                cell_map[cell].append(i)
-        for cell, ids in cell_map.items():
-            if len(ids) < 2:
-                continue
-            for a in range(len(ids)):
-                for b in range(a + 1, len(ids)):
-                    ia, ib = ids[a], ids[b]
-                    if same_net_ok and self.net_of[ia] == self.net_of[ib]:
+            for piece in p.pieces:
+                if piece.bbox:
+                    by_layer[piece.layer].append((piece.bbox, i))
+        for layer, entries in by_layer.items():
+            entries.sort(key=lambda t: t[0][0])
+            for k in range(len(entries)):
+                rect_a, ia = entries[k]
+                for rect_b, ib in entries[k + 1:]:
+                    if rect_b[0] > rect_a[2]:   # x0 strictly beyond
+                        break
+                    if same_net_ok and \
+                            self.net_of[ia] == self.net_of[ib]:
                         continue
-                    self.mutex.append((ia, ib))
+                    if self._rects_touch(rect_a, rect_b):
+                        self.mutex.append((ia, ib))
 
     # -- lazy connectivity ----------------------------------------------------
     def check_connectivity(self, selected):

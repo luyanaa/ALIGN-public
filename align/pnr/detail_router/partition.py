@@ -99,8 +99,10 @@ def partition_nets(net_pins, grid, max_region_nets=20, margin=None):
 def _solve_one(args):
     """Worker: build candidates + solve one region.  Runs in a child
     process; must be picklable, so everything it needs is passed in."""
-    region_nets, grid, guide_map, backend, solver_kw = args
-    cands = build_region_candidates(region_nets, grid, guide_map)
+    region_nets, grid, guide_map, backend, solver_kw, bnd, prects = args
+    cands = build_region_candidates(region_nets, grid, guide_map,
+                                    boundary_pins=bnd,
+                                    pin_rects=prects)
     if any(not v for v in cands.values()):
         return None
     n_pins = {net: len(pins) for net, pins in region_nets.items()}
@@ -121,8 +123,15 @@ def _solve_one(args):
 
 def route_parallel(net_pins, grid, guide_map=None, backend='sat',
                    solver_kw=None, n_workers=None,
-                   max_region_nets=20):
+                   max_region_nets=20, boundary_pins=None,
+                   pin_rects=None):
     """Route all nets, partitioned into regions solved in parallel.
+
+    ``boundary_pins`` is ``{net: pin_index}`` marking the synthetic
+    die-edge escape pin each net may carry; it is forwarded to the
+    candidate builder so those pins are not reserved as foreign
+    blockages.  ``pin_rects`` is ``{net: [{layer:[rect]}]}`` used for
+    precise pin-attachment overlap tests.
 
     Returns ``{net: [CandidatePath]}`` or ``None`` on any region
     failure.
@@ -131,7 +140,11 @@ def route_parallel(net_pins, grid, guide_map=None, backend='sat',
     regions = partition_nets(net_pins, grid, max_region_nets)
     if not regions:
         return {}
-    args = [(r, grid, guide_map or {}, backend, solver_kw)
+    bnd = boundary_pins or {}
+    prects = pin_rects or {}
+    args = [(r, grid, guide_map or {}, backend, solver_kw,
+             {n: i for n, i in bnd.items() if n in r},
+             {n: prects[n] for n in r if n in prects})
             for r in regions]
     if len(regions) == 1 or n_workers == 1:
         results = [_solve_one(a) for a in args]
