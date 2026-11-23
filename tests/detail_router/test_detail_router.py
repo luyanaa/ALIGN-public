@@ -124,6 +124,90 @@ def test_wire_bbox_orientation():
     assert x0 <= 240 <= x1
 
 
+def _pin_rect_intersects(foot, rect, eps=0):
+    """Closed-rect intersection (positive on area, or touching edges)."""
+    dx = min(foot[2], rect[2]) - max(foot[0], rect[0])
+    dy = min(foot[3], rect[3]) - max(foot[1], rect[1])
+    return dx >= eps and dy >= eps
+
+
+def test_pin_access_cells_intersect_pin_rect():
+    """Box ∩ lattice enumeration: every access cell physically touches
+    the pin rect on its own layer (no sampled points, no ±1 fudge)."""
+    g = _grid()
+    gen = CandidateGenerator(g)
+    cases = [
+        ('M1', (200, 100, 360, 300)),   # V layer, multi-track box
+        ('M2', (100, 200, 400, 340)),   # H layer, multi-track box
+        ('M3', (224, 88, 256, 312)),    # V layer, single-track box
+    ]
+    for layer, rect in cases:
+        pts = {(rect[0], rect[1], layer), (rect[2], rect[3], layer)}
+        cells = gen.pin_access_cells(pts, pin_rects={layer: [rect]},
+                                     max_cells=16)
+        assert cells, (layer, rect)
+        assert all(c[0] == layer for c in cells)
+        for _layer, gx, gy in cells:
+            assert (gx, gy) in g.allowed[layer]
+            foot = _cell_footprint(g, layer, (gx, gy))
+            assert _pin_rect_intersects(foot, rect), (layer, rect, foot)
+            # the emitted via/wire attaches at the anchor, so the anchor
+            # itself must sit on pin metal -- not merely the cell span
+            ax, ay = g.cell_anchor(layer, (gx, gy))
+            assert rect[0] <= ax <= rect[2] and rect[1] <= ay <= rect[3], \
+                (layer, (gx, gy), (ax, ay), rect)
+
+
+def test_pin_access_cells_anchor_inside_rect_regression():
+    """A segment that starts *below* the pin box must not become an
+    access cell: its anchor would emit a via off pin metal (the VOP
+    regression)."""
+    g = _grid(y1=1600)
+    gen = CandidateGenerator(g)
+    rect = (304, 1224, 336, 1464)       # M1: seg 1200 starts below box
+    cells = gen.pin_access_cells({(320, 1300, 'M1')},
+                                 pin_rects={'M1': [rect]})
+    assert cells
+    assert ('M1', 80, 300) not in cells          # anchor y=1200
+    for _layer, gx, gy in cells:
+        ax, ay = g.cell_anchor('M1', (gx, gy))
+        assert rect[0] <= ax <= rect[2] and rect[1] <= ay <= rect[3], \
+            ((gx, gy), (ax, ay))
+
+
+def test_pin_access_cells_subcell_pin_fallback():
+    """A pin smaller than one pitch cell has no track strictly inside;
+    the containing-cell fallback still yields access and it touches."""
+    g = _grid()
+    gen = CandidateGenerator(g)
+    rect = (100, 100, 120, 120)
+    cells = gen.pin_access_cells({(110, 110, 'M1')},
+                                 pin_rects={'M1': [rect]})
+    assert cells
+    for _layer, gx, gy in cells:
+        foot = _cell_footprint(g, 'M1', (gx, gy))
+        assert _pin_rect_intersects(foot, rect), foot
+
+
+def test_pin_access_cells_escape_scoring():
+    """An access cell whose only escapes run over foreign shapes ranks
+    below a fully clear cell; a clear cell scores zero."""
+    g = _grid()
+    gen = CandidateGenerator(g)
+    foreign = [('M1', (220, 100, 260, 200))]
+    blocked = ('M1', 60, 40)        # track x=240, segment y=160
+    assert gen._access_score('M1', blocked[1:], foreign) > 0
+    assert gen._access_score('M1', (80, 40), foreign) == 0
+
+    rect = (200, 81, 360, 200)
+    cells = gen.pin_access_cells({(280, 100, 'M1')},
+                                 max_cells=1, pin_rects={'M1': [rect]},
+                                 other_pin_rects=foreign)
+    assert cells
+    assert cells[0] != blocked
+    assert gen._access_score(cells[0][0], cells[0][1:], foreign) == 0
+
+
 def test_mutex_between_nets():
     g = _grid()
     net_pins = {

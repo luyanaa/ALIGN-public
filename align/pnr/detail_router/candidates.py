@@ -21,6 +21,18 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+def _ceil_div(a, b):
+    """Integer ceiling division (``b > 0``), exact for negatives too."""
+    return -((-a) // b)
+
+
+def _rect_overlap_area(a, b):
+    """Area of the intersection of two ``(x0, y0, x1, y1)`` rects."""
+    dx = min(a[2], b[2]) - max(a[0], b[0])
+    dy = min(a[3], b[3]) - max(a[1], b[1])
+    return dx * dy if dx > 0 and dy > 0 else 0
+
+
 @dataclass(frozen=True)
 class PathPiece:
     """One wire run or via inside a candidate path."""
@@ -141,102 +153,189 @@ class CandidateGenerator:
         return CandidatePath(net, a, b, tuple(pieces),
                              float(n_wire + 5 * n_vias), cells)
 
-    def pin_access_cells(self, pin_pts, max_cells=4, pin_rects=None):
+    # -- access-point geometry ---------------------------------------------
+    def _cell_footprint(self, layer, key):
+        """Pitch-cell footprint of a lattice key (physical rect).
+
+        Across the track the cell spans one pitch (nearest-track
+        rounding); along the preferred direction it spans one pitch from
+        the segment start.  This is the same footprint the grid uses to
+        decide covered cells, so an access cell "touches" a pin rect
+        exactly when these rects intersect.
+        """
+        m = self.grid.metals[layer]
+        p = m.pitch
+        x, y = self.grid.cell_anchor(layer, key)
+        if m.direction == 'V':
+            return (x - p // 2, y, x + p // 2, y + p)
+        return (x, y - p // 2, x + p, y + p // 2)
+
+    def _cells_inside_rect(self, layer, rect):
+        """Lattice keys whose *anchor point* lies inside the pin box on
+        ``layer``.
+
+        For a V-layer rect this is the set of tracks with
+        ``track_coord in [x0, x1]`` crossed with the segment cells whose
+        anchor ``seg_coord`` is inside ``[y0, y1]``.  H layers are
+        symmetric.
+
+        Anchoring inside the box (rather than merely overlapping the
+        box with the cell's pitch extent) is what makes the emitted
+        attachment geometric: candidate endpoints/vias are placed at the
+        cell anchor, so an anchor just outside the pin would produce a
+        via/wire that never touches pin metal even though the cell's
+        span clips the box.
+        """
+        m = self.grid.metals[layer]
+        p = m.pitch
+        x0, y0, x1, y1 = rect
+        ox, oy = self.grid.x0, self.grid.y0
+        if m.direction == 'V':
+            # cross axis = x (tracks), preferred axis = y (segments)
+            ti0 = _ceil_div(x0 - ox, p)
+            ti1 = (x1 - ox) // p
+            si0 = _ceil_div(y0 - oy, p)
+            si1 = (y1 - oy) // p
+        else:
+            # cross axis = y (tracks), preferred axis = x (segments)
+            ti0 = _ceil_div(y0 - oy, p)
+            ti1 = (y1 - oy) // p
+            si0 = _ceil_div(x0 - ox, p)
+            si1 = (x1 - ox) // p
+        if ti0 > ti1 or si0 > si1:
+            return []
+        nt, ns = self.grid.n_tracks(layer), self.grid.n_segs(layer)
+        out = []
+        for ti in range(max(0, ti0), min(nt - 1, ti1) + 1):
+            for si in range(max(0, si0), min(ns - 1, si1) + 1):
+                out.append(self.grid.cell_key(layer, ti, si))
+        return out
+
+    def _containing_cells(self, layer, rect):
+        """Fallback when a pin is smaller than one pitch cell: the
+        containing cells of the rect's two corners and centre.  Keeps a
+        routable (but sub-cell-sized) pin from getting zero access."""
+        x0, y0, x1, y1 = rect
+        out = []
+        seen = set()
+        for x, y in ((x0, y0), (x1, y1),
+                     ((x0 + x1) // 2, (y0 + y1) // 2)):
+            key = self.grid.cell_key_at(layer, x, y)
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+        return out
+
+    def _escape_rects(self, layer, key):
+        """The 1-2 wire strips the first segment would occupy leaving
+        an access cell along the layer's preferred direction."""
+        m = self.grid.metals[layer]
+        p, w = m.pitch, m.width
+        x, y = self.grid.cell_anchor(layer, key)
+        length = p + w
+        if m.direction == 'V':
+            return [(x - w // 2, y, x + w // 2, y + length),
+                    (x - w // 2, y - length, x + w // 2, y)]
+        return [(x, y - w // 2, x + length, y + w // 2),
+                (x - length, y - w // 2, x, y + w // 2)]
+
+    def _escape_overlap(self, layer, rect, other_pin_rects):
+        """Overlap area of an escape rect against blocked grid cells
+        (obstacles, which are already removed from ``grid.allowed``) and
+        against foreign / other-pin rects."""
+        m = self.grid.metals[layer]
+        p = m.pitch
+        x0, y0, x1, y1 = rect
+        ox, oy = self.grid.x0, self.grid.y0
+        allowed = self.grid.allowed[layer]
+        area = 0
+        if m.direction == 'V':
+            ti0 = _ceil_div(x0 - p // 2 - ox, p)
+            ti1 = (x1 + p // 2 - ox) // p
+            si0 = (y0 - oy) // p
+            si1 = (y1 - oy) // p
+        else:
+            ti0 = _ceil_div(y0 - p // 2 - oy, p)
+            ti1 = (y1 + p // 2 - oy) // p
+            si0 = (x0 - ox) // p
+            si1 = (x1 - ox) // p
+        nt, ns = self.grid.n_tracks(layer), self.grid.n_segs(layer)
+        for ti in range(max(0, ti0), min(nt - 1, ti1) + 1):
+            for si in range(max(0, si0), min(ns - 1, si1) + 1):
+                if ti < 0 or si < 0:
+                    continue
+                key = self.grid.cell_key(layer, ti, si)
+                if key not in allowed:
+                    area += _rect_overlap_area(
+                        rect, self._cell_footprint(layer, key))
+        for ly, r in other_pin_rects:
+            if ly == layer:
+                area += _rect_overlap_area(rect, r)
+        return area
+
+    def _access_score(self, layer, key, other_pin_rects):
+        """Score an access cell: the *least*-obstructed escape direction
+        (anaroute keeps zero-overlap directions, else the minimum)."""
+        return min(self._escape_overlap(layer, e, other_pin_rects)
+                   for e in self._escape_rects(layer, key))
+
+    def pin_access_cells(self, pin_pts, max_cells=4, pin_rects=None,
+                         other_pin_rects=None):
         """Return up to ``max_cells`` ``(layer, gx, gy)`` access cells
         for a pin whose ``pin_pts`` is a set of ``(x, y, layer)``
         access points (``gx``/``gy`` are unified lattice indices).
 
-        Cells on the pin's *own* layers are strongly preferred: a path
-        endpoint there physically terminates on pin metal (the via
-        stack the path builder inserts reaches down to the pin layer).
-
         ``pin_rects`` optionally supplies ``{layer: [rect,...]}`` -- the
-        pin's real shapes.  When given, an access cell is only kept if
-        a wire strip on its track (``track_coord +- width/2``)
-        geometrically overlaps at least one pin rect on that layer.
-        This rejects cells whose track quantisation landed just beside
-        the pin (which the point-sampled test could not distinguish).
+        pin's real shapes.  Access cells are the lattice tracks/segments
+        whose *anchor* falls inside the pin box (see
+        :meth:`_cells_inside_rect`), so the via/wire endpoint emitted at
+        that anchor is guaranteed to overlap pin metal on its own layer.
+        A pin smaller than one cell falls back to the cells containing
+        its corners/centre -- never zero access for a routable pin.
+
+        ``other_pin_rects`` optionally supplies additional
+        ``(layer, rect)`` shapes (other nets' pins and the same net's
+        other pins) used to score escape directions, so an access cell
+        whose only way out is over foreign pin metal ranks last.
         """
-        names = [m.name for m in self.grid.metal_list]
         legal = {m.name for m in self.layers}
-        out = []
-        seen = set()
-        pts = sorted(pin_pts)
         pin_rects = pin_rects or {}
+        other_pin_rects = list(other_pin_rects or ())
+        cands = []                      # (score, key)
+        seen = set()
 
-        def _touches(name, gx, gy):
-            """Does the cell's anchor point land on (or within one
-            wire half-width of) one of the pin's real rects on
-            ``name``?  Checks both grid axes -- a wire/via ending at
-            the cell anchor must geometrically meet pin metal, not
-            merely share a track."""
-            if name not in pin_rects:
-                # no rect info: accept if the point is on this layer
-                return any(p[2] == name for p in pts)
-            m = self.grid.metals[name]
-            hw = m.width // 2
-            cx, cy = self.cell_center(name, gx, gy)
-            return any(r[0] - hw <= cx <= r[2] + hw
-                       and r[1] - hw <= cy <= r[3] + hw
-                       for r in pin_rects[name])
+        def _add(layer, key):
+            if key in seen:
+                return
+            if key[1:] not in self.grid.allowed[layer]:
+                return
+            seen.add(key)
+            cands.append(
+                (self._access_score(layer, key[1:], other_pin_rects),
+                 key))
 
-        for deltas in ((0,), (1, -1), (2, -2)):
-            for d in deltas:
-                for x, y, layer in pts:
-                    if layer not in names:
-                        continue
-                    li = names.index(layer) + d
-                    if not (0 <= li < len(names)):
-                        continue
-                    name = names[li]
-                    if name not in legal:
-                        continue
-                    # a cell on a non-pin layer has no shape to touch;
-                    # accept it only in the relaxed rounds
-                    if d != 0 and name not in pin_rects:
-                        continue
-                    m = self.grid.metals[name]
-                    gx, gy = self.grid.cell_key_at(name, x, y)
-                    step = self._seg_step(name)
-                    # TODO(A1): the ±one-segment neighbours were added
-                    # because the old per-layer seg quantisation could
-                    # drop the reachable cell.  ``cell_key_at`` now
-                    # floors to the *containing* segment, so this may be
-                    # redundant; kept behaviour-preserving until e2e
-                    # validates its removal.
-                    if m.direction == 'V':
-                        cand = [(gx, gy + dd)
-                                for dd in (-step, 0, step)]
-                    else:
-                        cand = [(gx + dd, gy)
-                                for dd in (-step, 0, step)]
-                    for gx2, gy2 in cand:
-                        if gx2 < 0 or gy2 < 0 or \
-                                not _touches(name, gx2, gy2):
-                            continue
-                        key = (name, gx2, gy2)
-                        if key not in seen and \
-                                (gx2, gy2) in self.grid.allowed[name]:
-                            seen.add(key)
-                            out.append(key)
-            if out:
-                break
-        # final fallback: if nothing touched (pin off-grid), accept any
-        # free own-layer cell so the net still routes
-        if not out:
-            for x, y, layer in pts:
+        for layer, rects in pin_rects.items():
+            if layer not in legal:
+                continue
+            for rect in rects:
+                keys = self._cells_inside_rect(layer, rect)
+                if not any(k in self.grid.allowed[layer] for k in keys):
+                    # pin smaller than a cell, or landed between tracks
+                    keys = self._containing_cells(layer, rect)
+                for gx, gy in keys:
+                    _add(layer, (layer, gx, gy))
+
+        # no usable rects at all (callers without pin geometry): map the
+        # supplied access points to their containing cells
+        if not cands:
+            for x, y, layer in sorted(pin_pts):
                 if layer not in legal:
                     continue
-                m = self.grid.metals.get(layer)
-                if m is None:
-                    continue
                 gx, gy = self.grid.cell_key_at(layer, x, y)
-                key = (layer, gx, gy)
-                if key not in seen and \
-                        (gx, gy) in self.grid.allowed[layer]:
-                    seen.add(key)
-                    out.append(key)
-        return out[:max_cells]
+                _add(layer, (layer, gx, gy))
+
+        cands.sort(key=lambda t: (t[0], t[1]))
+        return [key for _score, key in cands[:max_cells]]
 
     def _vias_between(self, lx, ly, x, y):
         """Via pieces connecting two different layers, or [].
@@ -489,8 +588,14 @@ class CandidateGenerator:
         """
         if cell_lists is None:
             rect_lists = rect_lists or [{}] * len(pins)
-            cell_lists = [self.pin_access_cells(p, pin_rects=r)
-                          for p, r in zip(pins, rect_lists)]
+            cell_lists = []
+            for pi, (p, r) in enumerate(zip(pins, rect_lists)):
+                others = [(ly, rc)
+                          for pj, r2 in enumerate(rect_lists)
+                          if pj != pi and r2
+                          for ly, rs in r2.items() for rc in rs]
+                cell_lists.append(self.pin_access_cells(
+                    p, pin_rects=r, other_pin_rects=others))
         rect_lists = rect_lists or [None] * len(pins)
         out = []
         for a, b in self._choose_pairs(pins):
@@ -533,7 +638,9 @@ def build_region_candidates(net_pins, grid, guide_map=None,
 
     ``pin_rects`` optionally supplies ``{net: [{layer: [rect]}]}`` --
     the real pin shapes, forwarded to ``pin_access_cells`` so access
-    cells are only kept when their track overlaps actual pin metal.
+    cells are the exact pin-box ∩ lattice set.  Other nets' pin rects
+    (and the same net's other pins) are forwarded as escape-scoring
+    shapes, so falsely-blocked attachment points rank last.
     """
     gen = CandidateGenerator(grid)
     guide_map = guide_map or {}
@@ -547,8 +654,26 @@ def build_region_candidates(net_pins, grid, guide_map=None,
     lit_cells = {}
     for net, pins in net_pins.items():
         rect_lists = pin_rects.get(net) or [{}] * len(pins)
-        pin_cells[net] = [gen.pin_access_cells(p, pin_rects=r)
-                          for p, r in zip(pins, rect_lists)]
+        # shapes of *other* nets: an escape direction running over
+        # foreign pin metal is a bad first move, so score it out
+        foreign = []
+        for other, olists in pin_rects.items():
+            if other == net:
+                continue
+            for rl in olists:
+                for ly, rs in (rl or {}).items():
+                    foreign.extend((ly, r) for r in rs)
+        net_cells = []
+        for pi, (p, r) in enumerate(zip(pins, rect_lists)):
+            others = list(foreign)
+            for pj, r2 in enumerate(rect_lists):
+                if pj == pi or not r2:
+                    continue
+                for ly, rs in r2.items():
+                    others.extend((ly, rc) for rc in rs)
+            net_cells.append(gen.pin_access_cells(
+                p, pin_rects=r, other_pin_rects=others))
+        pin_cells[net] = net_cells
         lit_cells[net] = []
         for pi, pin in enumerate(pins):
             if pi == boundary_pins.get(net):

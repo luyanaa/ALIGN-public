@@ -12,6 +12,7 @@ import logging
 
 from .create_array_hierarchy import process_arrays
 from .util import compare_two_nodes, get_base_model, reduced_neighbors, reduced_SD_neighbors, get_leaf_connection, get_ports_weight
+from .motif_symmetry import find_motif_groups
 from ..schema import constraint
 from ..schema.graph import Graph
 from align.schema.subcircuit import SubCircuit
@@ -479,7 +480,64 @@ class add_symmetry_const:
             logger.debug(f"symmnet pairs: {pairs}, existing: {self.written_symmblocks}")
             self.filter_symnet_const(pairs)
             add_or_revert_const(pairsj, self.iconst, self.written_symmblocks)
+        # Additive motif-driven channel.  It only ever appends candidates, so
+        # the port-seeded results above are never removed.
+        self._motif_pairs()
         logger.debug(f"identified constraints of {self.name} are {self.iconst}")
+
+    def _port_claim_keys(self):
+        """Pairs already claimed by the port-seeded channel."""
+        keys = set()
+        for claim in self.written_symmblocks:
+            if isinstance(claim, str):
+                keys.add(frozenset((claim,)))
+            else:
+                keys.add(frozenset(claim))
+        return keys
+
+    def _motif_pairs(self):
+        """Emit high-confidence pairs found by the motif channel.
+
+        Vote policy (conservative, additive):
+
+        * ``motif+port``: the pair is already claimed by the port channel ->
+          nothing to emit, logged for provenance.
+        * ``motif-only`` *seed* pair (``DIFF_SOURCE``/``CROSS_LOAD``): emitted,
+          but only when the seed shares a two-device signal source net (see
+          :func:`motif_symmetry.find_motif_groups`).  This is the new coverage
+          the motif channel contributes.
+        * other ``motif-only`` pairs discovered by the DFS (LOAD/CASCODE and
+          terminals of a new diff pair): logged but **not emitted** unless the
+          port channel also found them, so two motif groups are never merged
+          and current-mirror loads are not silently turned into layout
+          symmetry constraints.
+        """
+        port_claims = self._port_claim_keys()
+        groups = find_motif_groups(self.subckt, set(self.stop))
+        motif_seen = set()
+        for group in groups:
+            candidates = []
+            for pair in group["pairs"]:
+                key = frozenset(pair)
+                motif_seen.add(key)
+                if key in port_claims:
+                    logger.debug(f"motif provenance: pair {pair[0]},{pair[1]} -> motif+port")
+                    continue
+                if pair == group["seed"]:
+                    logger.debug(f"motif provenance: pair {pair[0]},{pair[1]} -> motif-only")
+                    candidates.append([pair[0], pair[1]])
+                else:
+                    logger.debug(
+                        f"motif provenance: pair {pair[0]},{pair[1]} -> motif-only "
+                        f"(not emitted: DFS terminal of seed {group['seed']})"
+                    )
+            if not candidates:
+                continue
+            pairsj = self.filter_symblock_const(candidates)
+            if pairsj:
+                add_or_revert_const(pairsj, self.iconst, self.written_symmblocks)
+        for key in sorted(port_claims - motif_seen, key=lambda k: sorted(k)):
+            logger.debug(f"motif provenance: pair {sorted(key)} -> port-only")
 
     def pre_filter(self, key, value):
         smb_1d = set()
@@ -590,8 +648,46 @@ class add_symmetry_const:
                     logger.debug(f"skipping self symmetric nets {key} {value}")
 
 
+def _claimed_instances(written_symmblocks):
+    claimed = set()
+    for claim in written_symmblocks:
+        if isinstance(claim, str):
+            claimed.add(claim)
+        else:
+            claimed.update(claim)
+    return claimed
+
+
 def add_or_revert_const(pairsj: list, iconst, written_symmblocks: list):
     logger.debug(f"filtered symmetry pairs: {pairsj}")
+    # Conflict resolution, deterministic and logged.  An instance may appear in
+    # at most one symmetry group (and at most one pair within a group, enforced
+    # by the schema pairs_validator).  Priority: already-written constraints >
+    # the new candidate group.  Detect the conflict up front and skip the
+    # doomed pairs instead of relying on the schema to reject the whole group.
+    if not isinstance(pairsj, dict):
+        claimed = _claimed_instances(written_symmblocks)
+        kept = list()
+        dropped = list()
+        for pair in pairsj:
+            conflict = sorted(set(pair) & claimed)
+            if conflict:
+                dropped.append((pair, conflict))
+                continue
+            kept.append(pair)
+            claimed.update(pair)
+        if dropped:
+            for pair, conflict in dropped:
+                logger.debug(
+                    f"conflict resolution: dropping candidate pair {pair}; "
+                    f"instance(s) {conflict} already claimed by an existing symmetry group"
+                )
+            logger.debug(
+                f"conflict resolution: kept {kept}, dropped {[pair for pair, _ in dropped]}; "
+                f"priority existing-written > new-candidate"
+            )
+        pairsj = kept
+        logger.debug(f"resolved symmetry pairs: {pairsj}")
     if len(pairsj) > 1 or (pairsj and len(pairsj[0]) == 2):
         try:
             with set_context(iconst):
@@ -600,9 +696,8 @@ def add_or_revert_const(pairsj: list, iconst, written_symmblocks: list):
                 written_symmblocks.extend([set(pair) for pair in pairsj])
                 # written_symmblocks.extend([str(ele) for pair in pairsj for ele in pair])
                 logger.debug(f"one axis of written symmetries: {symmBlock}")
-        except:
-            logger.debug(f"skipping match {pairsj} due to unsatisfied constraints")
-            pass
+        except Exception as e:
+            logger.debug(f"skipping match {pairsj}: {e}")
 
 
 def symmnet_device_pairs(G, net_A, net_B, smb=list(), skip_blocks=None, user=False):

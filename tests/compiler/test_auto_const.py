@@ -1,3 +1,4 @@
+import logging
 import pathlib
 import pytest
 from align.schema.graph import Graph
@@ -6,6 +7,15 @@ from align.schema.types import set_context
 from align.compiler.util import get_ports_weight
 from align.compiler.compiler import compiler_input, annotate_library
 from align.compiler.find_constraint import add_or_revert_const, symmnet_device_pairs, recursive_start_points, add_symmetry_const, constraint_generator, self_sym_expand
+from align.compiler.motif_symmetry import (
+    classify_mos,
+    collect_mos_devices,
+    pair_pattern,
+    find_motif_groups,
+    DIFF_SOURCE,
+    LOAD,
+    INVALID,
+)
 from align.compiler.gen_abstract_name import PrimitiveLibrary
 import textwrap
 
@@ -300,4 +310,78 @@ def test_group_with_constraint():
     assert "Floorplan" in constraints, f"{ckt.constraints}"
     assert "DoNotIdentify" in constraints, f"{ckt.constraints}"
 
+    clean_data(name)
+
+
+def test_motif_classifier():
+    # Pure connection classifier (ConstGen MosType).
+    assert classify_mos(('n1', 'g', 'n1')) == 'CAP'      # S == D
+    assert classify_mos(('n1', 'g', 'g')) == 'DIODE'     # G == D
+    assert classify_mos(('n1', 'n1', 'n2')) == 'DUMMY'   # G == S
+    assert classify_mos(('n1', 'g', 'n2')) == 'DIFF'     # all distinct
+
+    name = f'ckt_{get_test_id()}'
+    example = build_example(name, ota_six(name), [])
+    ckt_library, _ = compiler_input(example, name, pdk_path, config_path)
+    ckt = ckt_library.find(name)
+    devices = collect_mos_devices(ckt)
+    assert set(devices) == {'MN1', 'MN2', 'MN3', 'MN4', 'MP5', 'MP6'}
+    assert devices['MN1']['mtype'] == 'DIODE'
+    assert devices['MP5']['mtype'] == 'DIODE'
+    assert devices['MN3']['mtype'] == 'DIFF'
+    assert devices['MP6']['mtype'] == 'DIFF'
+
+    # Pair motifs: input diff pair and mirror load.
+    assert pair_pattern(devices['MN3'], devices['MN4']) == DIFF_SOURCE
+    assert pair_pattern(devices['MP5'], devices['MP6']) == LOAD
+
+    # Hard matchedType+matchedSize gate: a different width means INVALID.
+    resized = dict(devices['MN3'])
+    resized['params'] = dict(devices['MN3']['params'], W='7.2E-07')
+    assert pair_pattern(resized, devices['MN4']) == INVALID
+    clean_data(name)
+
+
+def test_motif_seed_dfs_group():
+    name = f'ckt_{get_test_id()}'
+    example = build_example(name, ota_six(name), [])
+    ckt_library, _ = compiler_input(example, name, pdk_path, config_path)
+    ckt = ckt_library.find(name)
+
+    groups = find_motif_groups(ckt, set())
+    assert len(groups) == 1
+    group = groups[0]
+    # Seed: MN3/MN4 share source TAIL (two-device signal net).
+    assert set(group['seed']) == {'MN3', 'MN4'}
+    # DFS walks both drains to the shared-gate mirror load MP5/MP6.
+    assert {tuple(sorted(pair)) for pair in group['pairs']} == {
+        ('MN3', 'MN4'), ('MP5', 'MP6')}
+
+    # A source net explicitly marked as a stop point is not a seed.
+    assert find_motif_groups(ckt, {'TAIL'}) == []
+    clean_data(name)
+
+
+def test_conflict_resolution_logs_and_skips(caplog):
+    name = f'ckt_{get_test_id()}'
+    example = build_example(name, ota_six(name), [])
+    ckt_library, _ = compiler_input(example, name, pdk_path, config_path)
+    ckt = ckt_library.find(name)
+    caplog.set_level(logging.DEBUG, logger='align.compiler.find_constraint')
+
+    # MN3/MN4 is already claimed: the new group keeps only MP5/MP6, and the
+    # conflict is logged rather than raising from the schema validator.
+    written = [{'MN3', 'MN4'}]
+    add_or_revert_const([['MN3', 'MN4'], ['MP5', 'MP6']], ckt.constraints, written)
+    assert len(ckt.constraints) == 1
+    assert ckt.constraints[0].pairs == [['MP5', 'MP6']]
+    assert 'conflict resolution: dropping candidate pair' in caplog.text
+    assert 'already claimed by an existing symmetry group' in caplog.text
+
+    # A genuine schema rejection is still skipped, but now logs the reason.
+    caplog.clear()
+    add_or_revert_const([['MN3', 'MN1']], ckt.constraints, [])
+    assert len(ckt.constraints) == 1  # mismatched parameters rejected
+    assert 'skipping match' in caplog.text
+    assert 'Parameters of the symmetry pair' in caplog.text
     clean_data(name)
