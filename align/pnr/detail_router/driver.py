@@ -315,15 +315,13 @@ def _via_rect(grid, via_piece):
     so derive geometry from the bridged metal cells.
     """
     xs, ys, ws = [], [], []
-    for layer, ti, si in via_piece.cells:
+    for layer, gx, gy in via_piece.cells:
         m = grid.metals[layer]
         ws.append(m.width)
-        if m.direction == 'V':
-            xs.append(grid.track_coord(layer, ti))
-            ys.append(grid.seg_coord(layer, si))
-        else:
-            ys.append(grid.track_coord(layer, ti))
-            xs.append(grid.seg_coord(layer, si))
+        # unified lattice key -> physical point (layer-independent)
+        x, y = grid.cell_anchor(layer, (gx, gy))
+        xs.append(x)
+        ys.append(y)
     # cells from different layers quantise to slightly different
     # centres; average them so the via lands on the true junction
     cx = sum(xs) // len(xs)

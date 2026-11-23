@@ -5,7 +5,7 @@ from align.schema import constraint
 from align.schema.types import set_context
 from align.compiler.util import get_ports_weight
 from align.compiler.compiler import compiler_input, annotate_library
-from align.compiler.find_constraint import add_or_revert_const, symmnet_device_pairs, recursive_start_points, add_symmetry_const, constraint_generator
+from align.compiler.find_constraint import add_or_revert_const, symmnet_device_pairs, recursive_start_points, add_symmetry_const, constraint_generator, self_sym_expand
 from align.compiler.gen_abstract_name import PrimitiveLibrary
 import textwrap
 
@@ -108,7 +108,27 @@ def test_filter_duplicate_instances():
     add = add_symmetry_const(ckt, dict(), set(), [], None)
     pairs = [['MN3', 'MN4'], ['VIN', 'VIP'], ['MN4', 'MN4']]
     mpairs = add.filter_symblock_const(pairs)
-    assert mpairs == [['MN3', 'MN4']]
+    # MN2 is the drain-connected tail device on the shared source net (TAIL) of
+    # the MN3/MN4 pair, so it is expanded into the same self-symmetric axis.
+    assert mpairs == [['MN3', 'MN4'], ['MN2']]
+    clean_data(name)
+
+
+def test_self_sym_expand():
+    name = f'ckt_{get_test_id()}'
+    netlist = ota_six(name)
+    constraints = []
+    example = build_example(name, netlist, constraints)
+    ckt_library, _ = compiler_input(example, name, pdk_path, config_path)
+    ckt = ckt_library.find(name)
+    G = Graph(ckt)
+    # MN3/MN4 share their source net TAIL; MN2 drains into TAIL and is the
+    # self-symmetric tail/bias device on the same axis.
+    assert self_sym_expand(G, ckt, [['MN3', 'MN4']]) == [('MN2', ('MN3', 'MN4'))]
+    # Already-identified instances are not re-added.
+    assert self_sym_expand(G, ckt, [['MN3', 'MN4']], exclude=['MN2']) == []
+    # A non-device or non-differential pair yields no expansion.
+    assert self_sym_expand(G, ckt, [['VIN', 'VIP']]) == []
     clean_data(name)
 
 
@@ -122,7 +142,8 @@ def test_symmnet_filters():
     pairs = {1: {'MN3': 'MN4', 'VIN': 'VIP', 'MN4': 'MN4'}}
     add = add_symmetry_const(ckt, pairs, set(), [], None)
     add.loop_through_pairs()
-    assert ckt.constraints[0].pairs == [['MN3', 'MN4']]
+    # Tail device MN2 shares the symmetry axis of the MN3/MN4 diff pair.
+    assert ckt.constraints[0].pairs == [['MN3', 'MN4'], ['MN2']]
     clean_data(name)
 
 

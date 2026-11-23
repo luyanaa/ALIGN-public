@@ -20,7 +20,7 @@ collateral use; 1 unit = PDK grid unit, typically 0.5 nm * ScaleFactor).
 """
 
 import logging
-from collections import defaultdict
+from math import gcd
 
 logger = logging.getLogger(__name__)
 
@@ -91,14 +91,26 @@ def load_pdk_layers(pdk_json):
 class RoutingGrid:
     """Sparse track-aligned routing grid over the die bbox.
 
-    Nodes are ``(layer_name, ti, si)``:
-        ``ti`` -- track index on the *cross* axis (perpendicular to the
-                  preferred direction),
-        ``si`` -- segment index along the preferred direction, quantized
-                  to the layer pitch.
+    **Unified index frame.**  Every cell is identified by
+    ``(layer_name, gx, gy)`` where ``(gx, gy)`` are *global lattice*
+    indices with the same physical meaning on every layer::
 
-    ``allowed`` is a per-layer ``defaultdict(set)`` of ``(ti, si)`` cells
-    that are free for routing (not inside an obstacle).  Occupancy is the
+        gx = x // g,   gy = y // g
+
+    with ``g = gcd(all metal pitches)``.  So ``(gx, gy)`` always means
+    the physical point ``(gx * g, gy * g)`` -- a cell key on M1 and the
+    same key on M2 denote the *same* physical location (the earlier
+    per-layer ``(ti, si)`` frame did not: ``ti``/``si`` were per-layer
+    track/segment counts with mixed rounding, so the same tuple meant
+    different physical points on different layers).
+
+    The lattice is *not* the routing pitch: tracks still sit at each
+    layer's own ``Pitch`` (no density loss).  Cell keys are simply the
+    lower-left ``(track, segment-start)`` corner of the pitch cell
+    expressed in common ``g`` units.
+
+    ``allowed`` is a per-layer ``set`` of ``(gx, gy)`` cells that are
+    free for routing (not inside an obstacle).  Occupancy is the
     solver's job, not the grid's.
     """
 
@@ -107,7 +119,25 @@ class RoutingGrid:
         self.metals = {m.name: m for m in metal_infos}
         self.metal_list = list(metal_infos)      # ordered M1..Mn
         self.vias = via_infos                    # {(lo,hi): ViaInfo}
-        # allowed[layer] = set of (ti, si) free cells
+        # gcd of all metal pitches: the common lattice step.  For
+        # FinFET14nm_Mock (80/84) this is 4.
+        g = 0
+        for m in metal_infos:
+            g = gcd(g, m.pitch)
+        self.g = g or 1
+        assert self.g >= 1
+        # Track/segment coords are ``origin + index * pitch``; the
+        # lattice mapping is exact only when the bbox origin itself
+        # lands on the lattice.  Fall back to a consistent floor-divide
+        # (still monotone and layer-independent) if it does not.
+        self._origin_aligned = (self.x0 % self.g == 0
+                                and self.y0 % self.g == 0)
+        if not self._origin_aligned:
+            logger.warning(
+                'bbox origin (%s, %s) is not a multiple of lattice g=%s; '
+                'cell keys use floor division and physical anchors may '
+                'be off by <1 lattice step', self.x0, self.y0, self.g)
+        # allowed[layer] = set of (gx, gy) free cells
         self.allowed = {m.name: set() for m in metal_infos}
         self._init_free_cells()
 
@@ -146,6 +176,66 @@ class RoutingGrid:
         origin = self.y0 if m.direction == 'V' else self.x0
         return origin + si * m.pitch
 
+    # -- unified lattice cell keys ---------------------------------------
+    def lattice_coord(self, k):
+        """Physical coordinate of lattice index ``k`` (i.e. ``k * g``)."""
+        return k * self.g
+
+    def track_key(self, layer, coord):
+        """Lattice index of the track nearest ``coord`` on the cross axis.
+
+        Rounds to the nearest track (as the old ``track_index`` did), then
+        expresses the track position in global lattice units.
+        """
+        return self.track_coord(layer, self.track_index(layer, coord)) \
+            // self.g
+
+    def seg_key(self, layer, coord):
+        """Lattice index of the segment *containing* ``coord``.
+
+        Floors to the segment start along the preferred direction, then
+        expresses it in global lattice units.  Together with
+        :meth:`track_key` this is the only quantisation used to map a
+        physical point to a cell.
+        """
+        return self.seg_coord(layer, self.seg_index(layer, coord)) \
+            // self.g
+
+    def cell_key(self, layer, ti, si):
+        """Global lattice key ``(gx, gy)`` of cell ``(ti, si)``.
+
+        The axis order is always ``(x, y)`` -- *not* ``(track, seg)`` --
+        so the key has the same physical meaning on every layer.
+        """
+        m = self.metals[layer]
+        if m.direction == 'V':
+            return (self.track_coord(layer, ti) // self.g,
+                    self.seg_coord(layer, si) // self.g)
+        return (self.seg_coord(layer, si) // self.g,
+                self.track_coord(layer, ti) // self.g)
+
+    def cell_key_at(self, layer, x, y):
+        """Canonical map: physical point -> containing cell key.
+
+        This is the *single* containment lookup; nothing else should mix
+        :meth:`track_index`/:meth:`seg_index` quantisation.  A V-layer
+        cell rounds ``x`` to the nearest track and floors ``y`` to the
+        containing segment; an H-layer cell is symmetric.
+        """
+        m = self.metals[layer]
+        if m.direction == 'V':
+            return (self.track_key(layer, x), self.seg_key(layer, y))
+        return (self.seg_key(layer, x), self.track_key(layer, y))
+
+    def cell_anchor(self, layer, key):
+        """Physical ``(x, y)`` of a cell key's ``(track, seg-start)``.
+
+        Since a key is a global lattice coordinate pair, the answer is
+        layer-independent: ``(gx * g, gy * g)``.
+        """
+        gx, gy = key
+        return (gx * self.g, gy * self.g)
+
     def n_tracks(self, layer):
         m = self.metals[layer]
         span = (self.x1 - self.x0) if m.direction == 'V' else (self.y1 - self.y0)
@@ -160,26 +250,26 @@ class RoutingGrid:
     def _init_free_cells(self):
         for m in self.metal_list:
             self.allowed[m.name] = {
-                (ti, si)
+                self.cell_key(m.name, ti, si)
                 for ti in range(self.n_tracks(m.name))
                 for si in range(self.n_segs(m.name))
             }
 
     def reserve_cells(self, cells):
-        """Temporarily remove ``cells`` ``(layer, ti, si)`` from
+        """Temporarily remove ``cells`` ``(layer, gx, gy)`` from
         ``allowed`` and return them so callers can restore with
         ``unreserve_cells``.  Used to hide other nets' pin cells while
         generating candidates for one net."""
         removed = []
-        for layer, ti, si in cells:
-            if (ti, si) in self.allowed[layer]:
-                self.allowed[layer].discard((ti, si))
-                removed.append((layer, ti, si))
+        for layer, gx, gy in cells:
+            if (gx, gy) in self.allowed[layer]:
+                self.allowed[layer].discard((gx, gy))
+                removed.append((layer, gx, gy))
         return removed
 
     def unreserve_cells(self, cells):
-        for layer, ti, si in cells:
-            self.allowed[layer].add((ti, si))
+        for layer, gx, gy in cells:
+            self.allowed[layer].add((gx, gy))
 
     def block_region(self, layer, rect):
         """Mark cells whose track rectangle intersects ``rect`` as blocked.
@@ -205,25 +295,36 @@ class RoutingGrid:
         cells = self.allowed[layer]
         for ti in range(ti0, ti1 + 1):
             for si in range(si0, si1 + 1):
-                cells.discard((ti, si))
+                cells.discard(self.cell_key(layer, ti, si))
 
     # -- adjacency -------------------------------------------------------
     def neighbors(self, node):
-        """Yield adjacent grid nodes (along-track ±1 seg, or via up/down)."""
-        layer, ti, si = node
+        """Yield adjacent grid nodes.
+
+        ``node`` is ``(layer, gx, gy)``.  Along-track neighbours move by
+        ``pitch // g`` lattice steps along the preferred direction;
+        cross-track neighbours move by the same step across it.  A via
+        neighbour is the cell on an adjacent layer that *contains* the
+        same physical point (resolved through :meth:`cell_key_at`, so the
+        via is physically exact even though adjacent layers quantise the
+        point to different cell keys).
+        """
+        layer, gx, gy = node
         m = self.metals[layer]
-        for d in (-1, 1):
-            nb = (layer, ti, si + d)
-            if nb[2] >= 0 and nb in self.allowed[layer]:
-                yield nb
-            nb = (layer, ti + d, si)
-            if nb[1] >= 0 and nb in self.allowed[layer]:
-                yield nb
-        li = [x.name for x in self.metal_list].index(layer)
+        step = m.pitch // self.g
+        for dx, dy in ((-step, 0), (step, 0), (0, -step), (0, step)):
+            nbx, nby = gx + dx, gy + dy
+            if nbx < 0 or nby < 0:
+                continue
+            if (nbx, nby) in self.allowed[layer]:
+                yield (layer, nbx, nby)
+        names = [x.name for x in self.metal_list]
+        li = names.index(layer)
+        px, py = self.cell_anchor(layer, node)
         for dl in (-1, 1):
             nl = li + dl
-            if 0 <= nl < len(self.metal_list):
+            if 0 <= nl < len(names):
                 other = self.metal_list[nl].name
-                nb = (other, ti, si)
-                if nb in self.allowed[other]:
-                    yield nb
+                okey = self.cell_key_at(other, px, py)
+                if okey in self.allowed[other]:
+                    yield (other, *okey)

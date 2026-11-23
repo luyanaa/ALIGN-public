@@ -27,15 +27,17 @@ logger = logging.getLogger(__name__)
 
 
 def _footprint(grid, cells):
+    """Physical bbox of a candidate's cells.
+
+    ``cells`` are global-lattice keys ``(layer, gx, gy)`` in ``(x, y)``
+    order; ``cell_anchor`` is the canonical key -> physical map (the
+    same point on every layer).
+    """
     xs, ys = [], []
-    for layer, ti, si in cells:
-        m = grid.metals[layer]
-        if m.direction == 'V':
-            xs.append(grid.track_coord(layer, ti))
-            ys.append(grid.seg_coord(layer, si))
-        else:
-            ys.append(grid.track_coord(layer, ti))
-            xs.append(grid.seg_coord(layer, si))
+    for layer, gx, gy in cells:
+        x, y = grid.cell_anchor(layer, (gx, gy))
+        xs.append(x)
+        ys.append(y)
     return (min(xs), min(ys), max(xs), max(ys))
 
 

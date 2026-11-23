@@ -26,7 +26,7 @@ class PathPiece:
     """One wire run or via inside a candidate path."""
     kind: str                     # 'wire' or 'via'
     layer: str                    # metal layer (for a via: lower layer)
-    cells: frozenset              # (layer, ti, si) grid cells occupied
+    cells: frozenset              # (layer, gx, gy) lattice cells occupied
     bbox: tuple = ()              # (x0,y0,x1,y1) grid units, wires only
 
 
@@ -55,32 +55,43 @@ class CandidateGenerator:
                          if m.direction == 'H']
 
     # -- geometry helpers --------------------------------------------------
-    def cell_center(self, layer, ti, si):
-        m = self.grid.metals[layer]
-        if m.direction == 'V':
-            return (self.grid.track_coord(layer, ti),
-                    self.grid.seg_coord(layer, si))
-        return (self.grid.seg_coord(layer, si),
-                self.grid.track_coord(layer, ti))
+    # Cells are keyed ``(layer, gx, gy)`` in the *unified global lattice*
+    # frame: ``(gx, gy)`` always means physical ``(gx*g, gy*g)`` on every
+    # layer (see ``RoutingGrid``).  No ``(track, seg)`` order appears
+    # below -- the axis order is always ``(x, y)``.
+    def cell_center(self, layer, gx, gy):
+        """Physical anchor ``(x, y)`` of lattice cell ``(gx, gy)``.
+
+        The lattice key is layer-independent, so the answer is the same
+        on every layer (``cell_anchor``)."""
+        return self.grid.cell_anchor(layer, (gx, gy))
 
     def cell_at(self, layer, x, y):
-        m = self.grid.metals[layer]
-        ti = self.grid.track_index(layer, x if m.direction == 'V' else y)
-        si = self.grid.seg_index(layer, y if m.direction == 'V' else x)
-        return (ti, si)
+        """Containing cell key ``(gx, gy)`` for physical ``(x, y)``."""
+        return self.grid.cell_key_at(layer, x, y)
+
+    def _seg_step(self, layer):
+        """Lattice step between consecutive along-track cells."""
+        return self.grid.metals[layer].pitch // self.grid.g
 
     def _wire_cells_v(self, layer, x, y0, y1):
         """Cells of a vertical wire at ``x`` covering ``y0``..``y1``."""
-        ti, sa = self.cell_at(layer, x, y0)
-        _, sb = self.cell_at(layer, x, y1)
-        lo, hi = sorted((sa, sb))
-        return frozenset((layer, ti, s) for s in range(lo, hi + 1))
+        gx, ga = self.cell_at(layer, x, y0)
+        _, gb = self.cell_at(layer, x, y1)
+        # ``gx``/``ga``..``gb`` are global-lattice keys; the along-track
+        # cells are one layer pitch (``pitch // g`` lattice steps) apart.
+        step = self._seg_step(layer)
+        lo, hi = sorted((ga, gb))
+        return frozenset((layer, gx, s)
+                         for s in range(lo, hi + 1, step))
 
     def _wire_cells_h(self, layer, y, x0, x1):
-        ti, sa = self.cell_at(layer, x0, y)
-        _, sb = self.cell_at(layer, x1, y)
-        lo, hi = sorted((sa, sb))
-        return frozenset((layer, ti, s) for s in range(lo, hi + 1))
+        gx0, gy = self.cell_at(layer, x0, y)
+        gx1, _ = self.cell_at(layer, x1, y)
+        step = self._seg_step(layer)
+        lo, hi = sorted((gx0, gx1))
+        return frozenset((layer, s, gy)
+                         for s in range(lo, hi + 1, step))
 
     def _free(self, cells):
         return all((c[1], c[2]) in self.grid.allowed[c[0]]
@@ -89,30 +100,37 @@ class CandidateGenerator:
     def _wire_bbox(self, layer, cells):
         m = self.grid.metals[layer]
         hw = m.width // 2
-        tis = [t for (_l, t, s) in cells]
-        sis = [s for (_l, t, s) in cells]
-        c0 = self.grid.track_coord(layer, min(tis))
-        c1 = self.grid.track_coord(layer, max(tis))
-        s0 = self.grid.seg_coord(layer, min(sis))
-        s1 = self.grid.seg_coord(layer, max(sis)) + m.pitch
+        xs = [gx for (_l, gx, gy) in cells]
+        ys = [gy for (_l, gx, gy) in cells]
+        # ``cell_anchor`` is the canonical lattice-key -> physical
+        # ``(x, y)`` map (exact, not an approximation); no ``track``/
+        # ``seg`` reordering is needed because keys are already
+        # ``(x, y)``.
+        x0, y0 = self.grid.cell_anchor(layer, (min(xs), min(ys)))
+        x1, y1 = self.grid.cell_anchor(layer, (max(xs), max(ys)))
         if m.direction == 'V':
-            return (c0 - hw, s0, c1 + hw, s1)
-        return (s0, c0 - hw, s1, c1 + hw)
+            # along the preferred axis (y) a cell is one pitch long;
+            # across the track (x) it is ``width`` wide.
+            return (x0 - hw, y0, x1 + hw, y1 + m.pitch)
+        return (x0, y0 - hw, x1 + m.pitch, y1 + hw)
 
     def _via_stack(self, layer_lo, layer_hi, x, y):
         """Cells of a via chain between ``layer_lo`` and ``layer_hi``.
 
         Returns the frozenset of occupied cells on every intermediate
         layer (inclusive), or ``None`` if any layer lacks a free cell.
+        Each layer resolves the *same physical* ``(x, y)`` to its own
+        containing cell via ``cell_key_at`` -- the via point itself is
+        kept exact in the piece bbox.
         """
         names = [m.name for m in self.grid.metal_list]
         i0, i1 = sorted((names.index(layer_lo), names.index(layer_hi)))
         cells = set()
         for name in names[i0:i1 + 1]:
-            ti, si = self.cell_at(name, x, y)
-            if (ti, si) not in self.grid.allowed[name]:
+            gx, gy = self.grid.cell_key_at(name, x, y)
+            if (gx, gy) not in self.grid.allowed[name]:
                 return None
-            cells.add((name, ti, si))
+            cells.add((name, gx, gy))
         return frozenset(cells)
 
     # -- path constructors --------------------------------------------------
@@ -124,9 +142,9 @@ class CandidateGenerator:
                              float(n_wire + 5 * n_vias), cells)
 
     def pin_access_cells(self, pin_pts, max_cells=4, pin_rects=None):
-        """Return up to ``max_cells`` ``(layer, ti, si)`` access cells
+        """Return up to ``max_cells`` ``(layer, gx, gy)`` access cells
         for a pin whose ``pin_pts`` is a set of ``(x, y, layer)``
-        access points.
+        access points (``gx``/``gy`` are unified lattice indices).
 
         Cells on the pin's *own* layers are strongly preferred: a path
         endpoint there physically terminates on pin metal (the via
@@ -146,18 +164,18 @@ class CandidateGenerator:
         pts = sorted(pin_pts)
         pin_rects = pin_rects or {}
 
-        def _touches(name, ti, si):
-            """Does the cell's centre point land on (or within one
+        def _touches(name, gx, gy):
+            """Does the cell's anchor point land on (or within one
             wire half-width of) one of the pin's real rects on
             ``name``?  Checks both grid axes -- a wire/via ending at
-            the cell centre must geometrically meet pin metal, not
+            the cell anchor must geometrically meet pin metal, not
             merely share a track."""
             if name not in pin_rects:
                 # no rect info: accept if the point is on this layer
                 return any(p[2] == name for p in pts)
             m = self.grid.metals[name]
             hw = m.width // 2
-            cx, cy = self.cell_center(name, ti, si)
+            cx, cy = self.cell_center(name, gx, gy)
             return any(r[0] - hw <= cx <= r[2] + hw
                        and r[1] - hw <= cy <= r[3] + hw
                        for r in pin_rects[name])
@@ -178,19 +196,27 @@ class CandidateGenerator:
                     if d != 0 and name not in pin_rects:
                         continue
                     m = self.grid.metals[name]
-                    ti = self.grid.track_index(
-                        name, x if m.direction == 'V' else y)
-                    si = self.grid.seg_index(
-                        name, y if m.direction == 'V' else x)
-                    # try the quantised cell and its along-track
-                    # neighbours: seg quantisation can shift the cell
-                    # centre half a pitch off the pin rect
-                    for si2 in (si - 1, si, si + 1):
-                        if si2 < 0 or not _touches(name, ti, si2):
+                    gx, gy = self.grid.cell_key_at(name, x, y)
+                    step = self._seg_step(name)
+                    # TODO(A1): the ±one-segment neighbours were added
+                    # because the old per-layer seg quantisation could
+                    # drop the reachable cell.  ``cell_key_at`` now
+                    # floors to the *containing* segment, so this may be
+                    # redundant; kept behaviour-preserving until e2e
+                    # validates its removal.
+                    if m.direction == 'V':
+                        cand = [(gx, gy + dd)
+                                for dd in (-step, 0, step)]
+                    else:
+                        cand = [(gx + dd, gy)
+                                for dd in (-step, 0, step)]
+                    for gx2, gy2 in cand:
+                        if gx2 < 0 or gy2 < 0 or \
+                                not _touches(name, gx2, gy2):
                             continue
-                        key = (name, ti, si2)
+                        key = (name, gx2, gy2)
                         if key not in seen and \
-                                (ti, si2) in self.grid.allowed[name]:
+                                (gx2, gy2) in self.grid.allowed[name]:
                             seen.add(key)
                             out.append(key)
             if out:
@@ -204,13 +230,10 @@ class CandidateGenerator:
                 m = self.grid.metals.get(layer)
                 if m is None:
                     continue
-                ti = self.grid.track_index(
-                    layer, x if m.direction == 'V' else y)
-                si = self.grid.seg_index(
-                    layer, y if m.direction == 'V' else x)
-                key = (layer, ti, si)
+                gx, gy = self.grid.cell_key_at(layer, x, y)
+                key = (layer, gx, gy)
                 if key not in seen and \
-                        (ti, si) in self.grid.allowed[layer]:
+                        (gx, gy) in self.grid.allowed[layer]:
                     seen.add(key)
                     out.append(key)
         return out[:max_cells]
@@ -234,9 +257,10 @@ class CandidateGenerator:
         w = min(m.width for m in self.grid.metal_list) // 2
         vbox = (x - w, y - w, x + w, y + w)
         # one via piece per bridged adjacent-metal pair; ``bbox`` holds
-        # the true junction rect (grid cell centres of the two bridged
-        # layers can quantise half a pitch apart, so do NOT re-derive
-        # the via position from cells at emission time)
+        # the exact junction rect.  ``cell_key_at`` resolves the same
+        # physical point to each layer's containing cell, but those
+        # cells' anchors can still sit at different lattice points, so
+        # do NOT re-derive the via position from cells at emission time.
         for k in range(i0, i1):
             lo_name, hi_name = names[k], names[k + 1]
             via_name = self.grid.via_name(lo_name, hi_name)
@@ -284,8 +308,8 @@ class CandidateGenerator:
                     continue
                 # land the via on the wire's own track, not the raw
                 # endpoint coordinate (half-pitch quantisation gap)
-                wx = self.grid.track_coord(
-                    lay, next(iter({c[1] for c in cells})))
+                wx = self.grid.lattice_coord(
+                    next(iter({c[1] for c in cells})))
                 if not (self._junction_on_pin(wx, ay, rect_a, la)
                         and self._junction_on_pin(wx, by, rect_b, lb)):
                     continue
@@ -304,8 +328,8 @@ class CandidateGenerator:
                 cells = self._wire_cells_h(lay, ay, ax, bx)
                 if not self._free(cells):
                     continue
-                wy = self.grid.track_coord(
-                    lay, next(iter({c[1] for c in cells})))
+                wy = self.grid.lattice_coord(
+                    next(iter({c[2] for c in cells})))
                 if not (self._junction_on_pin(ax, wy, rect_a, la)
                         and self._junction_on_pin(bx, wy, rect_b, lb)):
                     continue
@@ -331,25 +355,31 @@ class CandidateGenerator:
             [l for l in self.h_layers if l != lb]
         if not alt_layers:
             v_opts, h_opts = v_opts[:1], h_opts[:1]
-        def _v_cells(lv, ti, y0, y1):
-            """Vertical wire cells on explicit track ``ti``."""
-            sa = self.cell_at(lv, 0, y0)[1]
-            sb = self.cell_at(lv, 0, y1)[1]
-            lo, hi = sorted((sa, sb))
-            return frozenset((lv, ti, s) for s in range(lo, hi + 1))
+        def _v_cells(lv, tk, y0, y1):
+            """Vertical wire cells on explicit track lattice key ``tk``."""
+            _, ga = self.cell_at(lv, 0, y0)
+            _, gb = self.cell_at(lv, 0, y1)
+            step = self._seg_step(lv)
+            lo, hi = sorted((ga, gb))
+            return frozenset((lv, tk, s)
+                             for s in range(lo, hi + 1, step))
 
-        def _h_cells(lh, ti, x0, x1):
-            sa = self.cell_at(lh, x0, 0)[1]
-            sb = self.cell_at(lh, x1, 0)[1]
-            lo, hi = sorted((sa, sb))
-            return frozenset((lh, ti, s) for s in range(lo, hi + 1))
+        def _h_cells(lh, tk, x0, x1):
+            ga, _ = self.cell_at(lh, x0, 0)
+            gb, _ = self.cell_at(lh, x1, 0)
+            step = self._seg_step(lh)
+            lo, hi = sorted((ga, gb))
+            return frozenset((lh, s, tk)
+                             for s in range(lo, hi + 1, step))
 
         def _variants(layer, coord):
-            """Track indices near ``coord`` -- the nearest track plus
-            its neighbours, so a leg can slide onto a track that
+            """Track lattice keys near ``coord`` -- the nearest track
+            plus its neighbours, so a leg can slide onto a track that
             actually reaches the pin/junction geometry."""
-            t0 = self.grid.track_index(layer, coord)
-            return {t0 - 1, t0, t0 + 1} - {-1}
+            step = self._seg_step(layer)
+            t0 = self.grid.track_key(layer, coord)
+            return {t0 - step, t0, t0 + step} - \
+                {k for k in (t0 - step, t0, t0 + step) if k < 0}
 
         for mode in ('v_first', 'h_first'):
             for lv in v_opts[:2]:
@@ -363,9 +393,9 @@ class CandidateGenerator:
                         ti_hs = _variants(lh, ay)
                         ti_vs = _variants(lv, bx)
                     for tiv in ti_vs:
-                        wx = self.grid.track_coord(lv, tiv)
+                        wx = self.grid.lattice_coord(tiv)
                         for tih in ti_hs:
-                            wy = self.grid.track_coord(lh, tih)
+                            wy = self.grid.lattice_coord(tih)
                             # legs run junction -> endpoint on their own
                             # tracks so the L physically connects
                             if mode == 'v_first':
@@ -537,12 +567,8 @@ def build_region_candidates(net_pins, grid, guide_map=None,
             else:
                 for x, y, layer in pin:
                     if layer in grid.metals:
-                        m = grid.metals[layer]
-                        ti = grid.track_index(
-                            layer, x if m.direction == 'V' else y)
-                        si = grid.seg_index(
-                            layer, y if m.direction == 'V' else x)
-                        cells.add((layer, ti, si))
+                        gx, gy = grid.cell_key_at(layer, x, y)
+                        cells.add((layer, gx, gy))
             lit_cells[net].append(cells)
 
     result = {}
@@ -577,7 +603,7 @@ def build_region_candidates(net_pins, grid, guide_map=None,
 
 
 def _cells_covered_by_rect(grid, layer, rect):
-    """Grid cells ``(layer, ti, si)`` whose wire footprint overlaps
+    """Grid cells ``(layer, gx, gy)`` whose wire footprint overlaps
     ``rect`` -- the same coverage ``RoutingGrid.block_region`` uses,
     returned as a set so the cells can be *reserved* (and restored)
     rather than permanently blocked."""
@@ -594,21 +620,18 @@ def _cells_covered_by_rect(grid, layer, rect):
         ti1 = grid.track_index(layer, r_y1 + hw)
         si0 = grid.seg_index(layer, r_x0)
         si1 = grid.seg_index(layer, r_x1)
-    return {(layer, ti, si)
-            for ti in range(ti0, ti1 + 1)
-            for si in range(si0, si1 + 1)}
+    cells = set()
+    for ti in range(ti0, ti1 + 1):
+        for si in range(si0, si1 + 1):
+            gx, gy = grid.cell_key(layer, ti, si)
+            cells.add((layer, gx, gy))
+    return cells
 
 
 def _cells_in_rect(grid, cells, rect):
     x0, y0, x1, y1 = rect
-    for layer, ti, si in cells:
-        m = grid.metals[layer]
-        if m.direction == 'V':
-            x = grid.track_coord(layer, ti)
-            y = grid.seg_coord(layer, si)
-        else:
-            y = grid.track_coord(layer, ti)
-            x = grid.seg_coord(layer, si)
+    for layer, gx, gy in cells:
+        x, y = grid.cell_anchor(layer, (gx, gy))
         if not (x0 <= x <= x1 and y0 <= y <= y1):
             return False
     return True

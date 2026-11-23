@@ -368,6 +368,85 @@ class process_input_const:
                     self.iconst.append(symb)
 
 
+def self_sym_expand(G, subckt, pairs, stop_points=(), exclude=()):
+    """Find drain-connected DIFF devices that share the symmetry axis of a pair.
+
+    Inspired by ConstGen's ``selfSymSrch``: starting from the shared source net
+    of an accepted differential pair, any other MOS device whose *drain* is tied
+    to that same net lies on the pair's tail/bias path and must be self-symmetric
+    about the same axis.
+
+    Predicate (documented exactly):
+      * ``src`` is the net where both devices of the pair connect via their
+        source pin (``pins['S']``).  If pin roles are unavailable, fall back to
+        the net shared by the two devices that is neither a gate net nor a
+        power/ground net (``stop_points``).
+      * A candidate ``d`` qualifies iff it is a MOS (``base_model`` NMOS/PMOS),
+        ``d`` is not ``a``/``b`` and not in ``exclude``, and ``d`` connects to
+        ``src`` through its drain pin (``pins['D'] == src``).  If the drain pin
+        is not labelled, fall back to: ``d`` touches ``src`` on any non-gate
+        net.  This is the closest analogue of ConstGen's "drain-connected DIFF
+        device reachable from the pair's source net".
+
+    Returns a list of ``(device_name, (a, b))`` tuples; the caller decides how
+    to place them into the existing symmetry group.  Pure function over the
+    graph/subckt so it is unit-testable.
+    """
+    def _pins(name):
+        inst = subckt.get_element(name)
+        return inst.pins if inst else {}
+
+    def _base(name):
+        try:
+            return get_base_model(subckt, name)
+        except AssertionError:
+            return None
+
+    expanded = []
+    seen = set(exclude)
+    for pair in pairs:
+        if len(pair) != 2:
+            continue
+        a, b = pair
+        if a == b or a not in G.nodes or b not in G.nodes:
+            continue
+        if not G.nodes[a].get("instance") or not G.nodes[b].get("instance"):
+            continue
+        if _base(a) not in ("NMOS", "PMOS") or _base(b) not in ("NMOS", "PMOS"):
+            continue
+
+        pins_a, pins_b = _pins(a), _pins(b)
+        src = pins_a.get("S")
+        if not src or src != pins_b.get("S"):
+            # Fallback: common non-gate, non-power/ground net.
+            gate_nets = {pins_a.get("G"), pins_b.get("G")} - {None}
+            common = set(pins_a.values()) & set(pins_b.values())
+            shared = sorted(common - gate_nets - set(stop_points))
+            src = shared[0] if shared else None
+        if not src:
+            logger.debug(f"self-sym expansion: no shared source net for pair {a, b}")
+            continue
+
+        for nbr in G.neighbors(src):
+            if nbr in (a, b) or nbr in seen:
+                continue
+            if not G.nodes[nbr].get("instance"):
+                continue
+            if _base(nbr) not in ("NMOS", "PMOS"):
+                continue
+            pins_d = _pins(nbr)
+            if "D" in pins_d:
+                qualifies = pins_d["D"] == src
+            else:
+                # Drain pin not labelled: any non-gate connection to src.
+                qualifies = src != pins_d.get("G")
+            if qualifies:
+                seen.add(nbr)
+                expanded.append((nbr, (a, b)))
+                logger.debug(f"self-sym expansion: added {nbr} on axis of pair {a, b}")
+    return expanded
+
+
 class add_symmetry_const:
     def __init__(self, subckt, match_pairs, stop_points, written_symmblocks, skip_const):
         self.all_pairs = sorted(
@@ -447,7 +526,37 @@ class add_symmetry_const:
                 else:
                     pairsj.append([key])
                     insts_in_single_symmetry.add(key)
+        # Expand accepted differential pairs with drain-connected DIFF devices
+        # sitting on the same symmetry axis (tail/bias path).
+        pairsj.extend(self._self_sym_expand(pairsj, insts_in_single_symmetry))
         return pairsj
+
+    def _self_sym_expand(self, pairsj: list, insts_in_single_symmetry: set):
+        device_pairs = [
+            pair for pair in pairsj
+            if len(pair) == 2
+            and all(x in self.G.nodes and self.G.nodes[x].get("instance") for x in pair)
+            and all(get_base_model(self.subckt, x) in ("NMOS", "PMOS") for x in pair)
+        ]
+        if not device_pairs:
+            return []
+        exclude = set(insts_in_single_symmetry)
+        for pair in pairsj:
+            exclude.update(pair)
+        for inst in self.written_symmblocks:
+            if isinstance(inst, str):
+                exclude.add(inst)
+            else:
+                exclude.update(inst)
+        result = []
+        for dev, _pair in self_sym_expand(
+            self.G, self.subckt, device_pairs, set(self.stop), exclude
+        ):
+            if dev in insts_in_single_symmetry or dev in result:
+                continue
+            insts_in_single_symmetry.add(dev)
+            result.append([dev])
+        return result
 
     def filter_symnet_const(self, pairs: list):
         for key, value in pairs:

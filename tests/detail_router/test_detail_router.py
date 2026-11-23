@@ -41,8 +41,48 @@ def test_block_region_removes_cells():
     g.block_region('M1', (200, 0, 240, 800))   # vertical bar on track 3
     after = len(g.allowed['M1'])
     assert before - after > 0
-    # track 3 (x=240) cells must be gone
-    assert all(t != 3 for (t, _s) in g.allowed['M1'])
+    # track 3 (x=240) cells must be gone; keys are unified lattice
+    # indices, so x=240 is gx = 240 // g.g = 60
+    assert all(gx != 60 for (gx, _gy) in g.allowed['M1'])
+
+
+def _cell_footprint(grid, layer, key):
+    """Pitch-cell footprint of a key: full pitch across the cross axis
+    (nearest-track rounding) and one pitch along the segment axis."""
+    gx, gy = key
+    m = grid.metals[layer]
+    x, y = grid.cell_anchor(layer, key)
+    p = m.pitch
+    if m.direction == 'V':
+        return (x - p // 2, y, x + p // 2, y + p)
+    return (x, y - p // 2, x + p, y + p // 2)
+
+
+def test_cell_key_at_contains_physical_point():
+    """``cell_key_at`` is the canonical containment map: the cell it
+    returns physically contains the query point on *every* layer."""
+    g = _grid()
+    for layer in ('M1', 'M2', 'M3'):
+        for x, y in ((240, 168), (100, 100), (400, 400), (80, 84)):
+            key = g.cell_key_at(layer, x, y)
+            r = _cell_footprint(g, layer, key)
+            assert r[0] <= x <= r[2] and r[1] <= y <= r[3], \
+                (layer, (x, y), key, r)
+
+
+def test_cell_key_same_physical_point_all_layers():
+    """A cell key denotes the same physical point on every layer -- the
+    core A1 invariant."""
+    g = _grid()
+    assert g.g == 4
+    for layer in ('M1', 'M2', 'M3'):
+        assert g.cell_anchor(layer, (60, 42)) == (240, 168)
+        # a junction at physical (240, 168) resolves to that same
+        # lattice point wherever the layer's tracks/segments fall on it
+        key = g.cell_key_at(layer, 240, 168)
+        px, py = g.cell_anchor(layer, key)
+        fr = _cell_footprint(g, layer, key)
+        assert fr[0] <= 240 <= fr[2] and fr[1] <= 168 <= fr[3]
 
 
 def test_candidates_two_pin_net():
@@ -62,6 +102,26 @@ def test_candidates_same_row_straight():
     pins = [{(100, 168, 'M2')}, {(400, 168, 'M2')}]
     cands = gen.candidates_for_net('N2', pins)
     assert any(all(c[0] == 'M2' for c in p.cells) for p in cands)
+
+
+def test_wire_bbox_orientation():
+    """Wire bboxes are physical rects: long along the layer's preferred
+    direction, exactly ``width`` across the track.  Keys are (x, y) on
+    every layer."""
+    g = _grid()
+    gen = CandidateGenerator(g)
+
+    cells = gen._wire_cells_h('M2', 168, 100, 400)
+    x0, y0, x1, y1 = gen._wire_bbox('M2', cells)
+    assert x1 - x0 > y1 - y0                 # H layer: long in x
+    assert y1 - y0 == g.metals['M2'].width
+    assert y0 <= 168 <= y1
+
+    cells = gen._wire_cells_v('M1', 240, 100, 400)
+    x0, y0, x1, y1 = gen._wire_bbox('M1', cells)
+    assert y1 - y0 > x1 - x0                 # V layer: long in y
+    assert x1 - x0 == g.metals['M1'].width
+    assert x0 <= 240 <= x1
 
 
 def test_mutex_between_nets():

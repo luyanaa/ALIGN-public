@@ -19,6 +19,7 @@ so we keep RALF's ``p = 1`` supply convention).
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,45 @@ def symmetry_penalty(placement, problem):
     return pen
 
 
+@dataclass(frozen=True)
+class CostComponents:
+    """Unweighted (raw) energy sub-terms for one placement.
+
+    Keeping the raw, unweighted values separate from the scalar energy lets
+    callers
+
+    * initialise penalty weights by magnitude-matching to ``hpwl`` (B1),
+    * drive subgradient weight updates from the raw violation magnitude, and
+    * run a violation-driven early stop on the raw values.
+
+    ``congestion`` is the raw RUDY estimate (the energy uses its square root,
+    matching RALF); ``overlap`` is total pairwise instance-bbox overlap area;
+    ``symmetry`` is :func:`symmetry_penalty` (squared centreline deviation).
+    """
+
+    hpwl: float
+    congestion: float
+    overlap: float
+    symmetry: float
+
+
+def raw_components(placement, problem, hpwl_metric=None, rudy_metric=None):
+    """Return the four unweighted :class:`CostComponents` for ``placement``.
+
+    ``hpwl_metric``/``rudy_metric`` may be supplied to reuse already-built
+    metric objects (and their cached problem reference); otherwise they are
+    constructed here.
+    """
+    hpwl_metric = hpwl_metric or HPWLMetric(problem)
+    rudy_metric = rudy_metric or RUDYCongestion(problem, hpwl_metric)
+    return CostComponents(
+        hpwl=hpwl_metric(placement),
+        congestion=rudy_metric(placement),
+        overlap=overlap_area(placement, problem),
+        symmetry=symmetry_penalty(placement, problem),
+    )
+
+
 def make_cost(problem, weight_congestion=1.0, weight_overlap=1.0):
     """Return ``cost(placement) = HPWL + wc*sqrt(congestion) + wo*overlap``.
 
@@ -225,9 +265,10 @@ def make_cost(problem, weight_congestion=1.0, weight_overlap=1.0):
 
     def cost(placement):
         import math
-        return (hpwl(placement)
-                + weight_congestion * math.sqrt(max(rudy(placement), 0.0))
-                + weight_overlap * overlap_area(placement, problem))
+        parts = raw_components(placement, problem, hpwl, rudy)
+        return (parts.hpwl
+                + weight_congestion * math.sqrt(max(parts.congestion, 0.0))
+                + weight_overlap * parts.overlap)
 
     cost.hpwl = hpwl       # exposed for diagnostics
     cost.rudy = rudy
