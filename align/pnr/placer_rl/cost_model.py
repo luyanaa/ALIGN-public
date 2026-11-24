@@ -18,10 +18,60 @@ so we keep RALF's ``p = 1`` supply convention).
 """
 
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+# Names that denote a power/ground rail or module port rather than an
+# auto-generated internal net (ALIGN names internal nets ``NET0``, ``NET1``,
+# ...).  Kept deliberately broad so the escape-cost helper also works for
+# netlists that do not expose ``module['parameters']`` to the placer.
+_POWER_NET_RE = re.compile(
+    r'vdd|vss|gnd|vcc|power|avdd|dvdd|avss|dvss|vph|vpn', re.IGNORECASE)
+_INTERNAL_NET_RE = re.compile(r'NET\d+', re.IGNORECASE)
+
+
+def _is_port_like(name):
+    """Heuristic: does ``name`` look like a module port / power rail?
+
+    ALIGN's placement-verilog parameters are upper-case identifiers
+    (``VINN``, ``VBIASN``, ``ID``, ...) while internal nets are ``NET<n>``;
+    ground is the literal ``0``.  Lower-case internal aliases such as
+    ``n2`` are *not* treated as ports.
+    """
+    if not name:
+        return False
+    if name in ('0', '1'):
+        return True
+    if _POWER_NET_RE.search(name):
+        return True
+    if _INTERNAL_NET_RE.fullmatch(name):
+        return False
+    return bool(re.search(r'[A-Z]', name)) and name.upper() == name
+
+
+def infer_port_nets(nets, parameters=None):
+    """Return the set of net names that must reach the die boundary.
+
+    ``parameters`` (the module's port list from ``module['parameters']``)
+    wins when supplied; power/ground names present in the netlist are always
+    included.  When it is unavailable the port names are inferred from the
+    netlist using :func:`_is_port_like`.
+    """
+    names = {net.get('name') for net in nets if net.get('name') is not None}
+    ports = set()
+    if parameters:
+        params = set(parameters)
+        for nm in names:
+            if nm in params or nm in ('0', '1') or _POWER_NET_RE.search(nm):
+                ports.add(nm)
+    else:
+        for nm in names:
+            if _is_port_like(nm):
+                ports.add(nm)
+    return ports
 
 
 class PlacementProblem:
@@ -36,14 +86,30 @@ class PlacementProblem:
             where ``bbox_fn(placement)`` is resolved at evaluation time from
             pin geometry.  ``pins`` may instead carry fixed
             ``(x, y)`` terminal coordinates for module pins.
+        port_nets: set of net names/indices that must escape to the die
+            boundary (module parameters plus power/ground rails).  Inferred
+            from the net names when not supplied.
+        parameters: optional ``module['parameters']`` port list.
+        die: optional ``(die_w, die_h)`` reference rectangle for
+            :func:`escape_cost`; solvers that allocate a die set it.
     """
 
-    def __init__(self, name, instances, nets, symmetry=None):
+    def __init__(self, name, instances, nets, symmetry=None, *,
+                 parameters=None, port_nets=None):
         self.name = name
         self.instances = instances
         self.nets = nets
         # [{pairs: [[inst_idx,...],...], direction: 'V'|'H'}]
         self.symmetry = symmetry or []
+        # Module ports / power rails: nets that need a die-boundary exit.
+        self.parameters = list(parameters or [])
+        if port_nets is not None:
+            self.port_nets = set(port_nets)
+        else:
+            self.port_nets = infer_port_nets(nets, self.parameters)
+        # Set by solvers that know the die (``RLEnvironment``); used as the
+        # default reference rectangle for :func:`escape_cost`.
+        self.die = None
 
     @property
     def n(self):
@@ -99,6 +165,73 @@ class HPWLMetric:
             llx, lly, urx, ury = self.net_bbox(net, boxes)
             hpwl += (urx - llx) + (ury - lly)
         return hpwl
+
+
+def escape_cost(placement, problem, port_nets=None, die=None):
+    """Sum of port-net distances to their nearest die edge.
+
+    For every port net (module ``parameters`` plus power/ground rails) the
+    net's pin bounding box is measured against the die rectangle
+    ``(0, 0, die_w, die_h)`` and the *nearest* edge distance is accumulated::
+
+        escape = sum_over_port_nets min( x_lo, y_lo,
+                                         die_w - x_hi, die_h - y_hi )
+
+    A pin/net already touching an edge contributes ``0``; an interior net
+    contributes its positive distance.  Distances are clamped at zero so a
+    net that hangs slightly outside the die does not earn a negative cost.
+    Only pins of instances present in ``placement`` are considered, which
+    makes the helper usable on partial (in-progress) RL placements.
+
+    ``port_nets`` may contain net names or net indices; when omitted the
+    problem's :attr:`PlacementProblem.port_nets` is used.  ``die`` defaults
+    to ``problem.die`` and, failing that, the placement's own bbox.
+    """
+    if port_nets is None:
+        port_nets = getattr(problem, 'port_nets', None) or set()
+    if not port_nets:
+        return 0.0
+    port_nets = set(port_nets)
+    boxes = {}
+    for idx, inst in enumerate(problem.instances):
+        if idx not in placement:
+            continue
+        x, y, _ = placement[idx]
+        boxes[idx] = (x, y, x + inst['width'], y + inst['height'])
+    if not boxes:
+        return 0.0
+    if die is None:
+        die = getattr(problem, 'die', None)
+    if die is None:
+        die = (max(b[2] for b in boxes.values()),
+               max(b[3] for b in boxes.values()))
+    die_w, die_h = die
+    total = 0.0
+    for ni, net in enumerate(problem.nets):
+        if net.get('name') not in port_nets and ni not in port_nets:
+            continue
+        llx = lly = urx = ury = None
+        for pin in net['pins']:
+            if 'fixed' in pin:
+                x0, y0 = pin['fixed']
+                r = (x0, y0, x0, y0)
+            else:
+                idx = pin['inst']
+                if idx not in boxes:
+                    continue  # partial placement: instance not placed yet
+                if 'rect' in pin:
+                    r = pin['rect'](boxes[idx])
+                else:
+                    r = boxes[idx]
+            llx = r[0] if llx is None else min(llx, r[0])
+            lly = r[1] if lly is None else min(lly, r[1])
+            urx = r[2] if urx is None else max(urx, r[2])
+            ury = r[3] if ury is None else max(ury, r[3])
+        if llx is None:
+            continue
+        d = min(llx, lly, die_w - urx, die_h - ury)
+        total += max(0.0, d)
+    return total
 
 
 class RUDYCongestion:

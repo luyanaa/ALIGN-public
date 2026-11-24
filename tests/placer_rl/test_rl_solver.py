@@ -11,7 +11,7 @@ import pytest
 torch = pytest.importorskip('torch')
 
 from align.pnr.placer_rl.cost_model import (  # noqa: E402
-    PlacementProblem, symmetry_penalty)
+    PlacementProblem, escape_cost, overlap_area, symmetry_penalty)
 from align.pnr.placer_rl.driver import build_problem  # noqa: E402
 from align.pnr.placer_rl.rl_solver import (  # noqa: E402
     RLEnvironment, RLPlacementSolver, parse_device_type)
@@ -232,3 +232,121 @@ def test_solve_legalises_symmetric_pairs_exactly():
         # rounding of the partner derivation (<= 2 in the doubled sum).
         assert max(sums) - min(sums) <= 2
 
+
+
+# ---------------------------------------------------------------------------
+# (g) boundary-escape shaping is wired into the step reward / packing
+# ---------------------------------------------------------------------------
+
+def port_problem():
+    """Two port-connected instances plus one internal instance."""
+    instances = [
+        {'instance_name': 'A', 'concrete_template_name': 'NMOS_S_1',
+         'width': 10, 'height': 10, 'rotatable': True},
+        {'instance_name': 'B', 'concrete_template_name': 'PMOS_S_1',
+         'width': 10, 'height': 10, 'rotatable': True},
+        {'instance_name': 'C', 'concrete_template_name': 'CAP_1',
+         'width': 10, 'height': 10, 'rotatable': True},
+        {'instance_name': 'D', 'concrete_template_name': 'RES_1',
+         'width': 10, 'height': 10, 'rotatable': True},
+    ]
+    nets = [
+        {'name': 'VDD', 'pins': [{'inst': 0, 'pin': 'p'},
+                                 {'inst': 1, 'pin': 'p'}]},
+        {'name': 'VOUTP', 'pins': [{'inst': 2, 'pin': 'p'},
+                                   {'inst': 3, 'pin': 'p'}]},
+        {'name': 'NET1', 'pins': [{'inst': 1, 'pin': 'p'},
+                                  {'inst': 2, 'pin': 'p'}]},
+    ]
+    return PlacementProblem('PORT', instances, nets,
+                            port_nets={'VDD', 'VOUTP'})
+
+
+def test_env_has_escape_and_compaction_terms():
+    p = port_problem()
+    env = RLEnvironment(p, grid=16, seed=0)
+    assert env.port_net_idx == {0, 1}
+    assert env.w_escape > 0.0
+    assert env.w_compact > 0.0
+    env.reset()
+    env.order = [0, 1, 2, 3]
+    # put instance A at the (interior) centre: its VDD net is far from edges
+    env.step(0, 4, 4, 0)
+    before = env._net_escape(0)
+    assert before > 0.0
+    # snapping A onto the die corner reduces the port-net escape distance
+    env2 = RLEnvironment(p, grid=16, seed=0)
+    env2.reset()
+    env2.order = [0, 1, 2, 3]
+    env2.step(0, 0, 0, 0)
+    assert env2._net_escape(0) == 0.0 < before
+
+
+def test_solve_packs_ports_closer_to_edge_than_random_scatter():
+    """The escape/compaction shaping makes the solved placement at least as
+    boundary-friendly as a uniform random scatter over the same die."""
+    p = port_problem()
+    solver = RLPlacementSolver(p, seed=0, n_episodes=30, grid=8)
+    placement, bbox, _ = solver.solve()
+    rl_escape = escape_cost(placement, p, p.port_nets,
+                            die=solver.env.die)
+    die_w, die_h = solver.env.die
+    scatter = {
+        0: (die_w // 2, die_h // 2, 0),
+        1: (die_w // 2, die_h // 2, 0),
+        2: (die_w // 2, die_h // 2, 0),
+        3: (die_w // 2, die_h // 2, 0),
+    }
+    scatter_escape = escape_cost(scatter, p, p.port_nets,
+                                 die=solver.env.die)
+    assert scatter_escape > 0.0
+    assert rl_escape <= scatter_escape
+
+
+def self_symmetric_singletons_problem():
+    """Three self-symmetric V-axis blocks plus one free block.
+
+    This mirrors the telescopic-OTA constraint shape that makes the legaliser
+    collapse every self-symmetric block onto one axis: only y can separate
+    them, so the post-legalisation column compactor must produce a legal,
+    tightly packed column.
+    """
+    sizes = [(10, 20), (10, 30), (10, 15), (30, 10)]
+    instances = [
+        {'instance_name': f'I{i}', 'concrete_template_name': 'L',
+         'width': w, 'height': h, 'rotatable': True}
+        for i, (w, h) in enumerate(sizes)]
+    nets = [
+        {'name': 'VDD', 'pins': [{'inst': 0, 'pin': 'p'},
+                                 {'inst': 1, 'pin': 'p'}]},
+        {'name': 'VOUTP', 'pins': [{'inst': 2, 'pin': 'p'},
+                                   {'inst': 3, 'pin': 'p'}]},
+    ]
+    symmetry = [{'pairs': [[0], [1], [2]], 'direction': 'V'}]
+    return PlacementProblem('COL', instances, nets, symmetry)
+
+
+def test_solve_self_symmetric_singletons_packs_legal_column():
+    p = self_symmetric_singletons_problem()
+    solver = RLPlacementSolver(p, seed=0, n_episodes=5, grid=8)
+    placement, bbox, energy = solver.solve()
+    # no overlaps after the column compaction
+    assert overlap_area(placement, p) == 0.0
+    # the three self-symmetric blocks share the minimum feasible axis
+    axis = max(p.instances[i]['width'] / 2 for i in (0, 1, 2))
+    for i in (0, 1, 2):
+        centre = placement[i][0] + p.instances[i]['width'] / 2
+        assert abs(centre - axis) <= 0.5
+    # y-bands are disjoint and stacked from the origin
+    ys = sorted((placement[i][1], placement[i][1] + p.instances[i]['height'])
+                for i in (0, 1, 2))
+    assert ys[0][0] == 0
+    for (_, hi), (lo, _) in zip(ys, ys[1:]):
+        assert lo >= hi
+    # the free block is flush to the right of the column
+    col_right = max(placement[i][0] + p.instances[i]['width']
+                    for i in (0, 1, 2))
+    assert placement[3][0] == col_right
+    # tight column: bbox height is the sum of the stacked group heights
+    assert bbox[1] == sum(p.instances[i]['height'] for i in (0, 1, 2))
+    assert bbox[0] == col_right + p.instances[3]['width']

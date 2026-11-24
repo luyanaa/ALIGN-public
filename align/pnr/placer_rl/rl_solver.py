@@ -25,7 +25,7 @@ import random
 import re
 
 from .cost_model import (HPWLMetric, RUDYCongestion, _strict_intersection_area,
-                         raw_components, symmetry_penalty)
+                         escape_cost, raw_components, symmetry_penalty)
 from . import legalizer
 
 logger = logging.getLogger(__name__)
@@ -228,12 +228,17 @@ class RLEnvironment:
 
         r_t = -(d_hpwl_local + d_sqrt(rudy_local))
               - overlap_inc * overlap_penalty
+              - w_escape * d_escape_port_nets
+              - w_compact * (x + y)
               [ - w_sym * symmetry_penalty(placement, problem) at terminal ]
 
     where ``*_local`` only recomputes the nets touching the just-placed
     instance (net bboxes are cached incrementally, so the rest of the netlist
     is never recomputed) and ``overlap_inc`` is the strict overlap area the
-    new instance introduces against already-placed instances.
+    new instance introduces against already-placed instances.  The escape
+    term rewards moving port nets toward the nearest die edge; the
+    compaction term is a mild Manhattan pull toward the origin that makes the
+    policy pack instead of scattering across the whole die.
     """
 
     def __init__(self, problem, grid=32, overlap_penalty=1.0, seed=0):
@@ -244,8 +249,20 @@ class RLEnvironment:
         side = sum(max(i['width'], i['height']) for i in problem.instances)
         side = max(side, 1)
         self.die = (side, side)
+        # Expose the die so ``cost_model.escape_cost`` uses the same
+        # reference rectangle when called with 3 arguments.
+        problem.die = self.die
         self.hpwl = HPWLMetric(problem)
         self.rudy = RUDYCongestion(problem, self.hpwl)
+
+        # port nets: the nets that must escape to the die boundary (module
+        # parameters like VINN/VOUTN/ID plus VDD/0/GND/VSS rails).
+        self.port_nets = set(getattr(problem, 'port_nets', None) or set())
+        self.port_net_names = {n for n in self.port_nets
+                               if isinstance(n, str)}
+        self.port_net_idx = {
+            ni for ni, net in enumerate(problem.nets)
+            if net.get('name') in self.port_net_names or ni in self.port_nets}
 
         # incidence lists (net <-> instance) used for incremental updates
         self.inst_nets = [[] for _ in range(problem.n)]
@@ -270,6 +287,36 @@ class RLEnvironment:
                 self.w_sym = max(abs(self.hpwl0), 1.0)
         else:
             self.w_sym = 0.0
+
+        # ---- compaction / boundary-escape shaping weights ------------------
+        # HPWL-scale reference: fall back to the die diagonal for net-free
+        # modules so the pull is never exactly zero.
+        ref = max(self.hpwl0, self.die[0] + self.die[1])
+        # Manhattan pull toward the origin (die corner).  One episode's full
+        # pull sums to ~compact_frac * ref, i.e. a mild quality nudge.
+        compact_frac = 0.25
+        self.w_compact = (compact_frac * ref
+                          / max(problem.n, 1)
+                          / max(self.die[0] + self.die[1], 1))
+        # Boundary escape: a per-step decrease in the summed port-net
+        # distance-to-nearest-edge is rewarded.  ``escape_scale`` is half the
+        # worst-case sum (die width+height per port net).
+        escape_frac = 0.5
+        self.escape_scale = (0.5 * len(self.port_net_idx)
+                             * (self.die[0] + self.die[1]))
+        if self.escape_scale > 0:
+            self.w_escape = escape_frac * self.hpwl0 / self.escape_scale
+        else:
+            self.w_escape = 0.0
+
+    def _net_escape(self, ni):
+        """Distance of port net ``ni``'s placed-pin bbox to the nearest die
+        edge (0 when it already touches/overhangs an edge)."""
+        b = self._net_bbox(self.problem.nets[ni], self.boxes)
+        if b is None:
+            return 0.0
+        return max(0.0, min(b[0], b[1],
+                            self.die[0] - b[2], self.die[1] - b[3]))
 
     def reset(self):
         self.order = list(range(self.problem.n))
@@ -355,9 +402,11 @@ class RLEnvironment:
             overlap_inc += _strict_intersection_area(new_box, other)
 
         affected = list(self.inst_nets[inst_idx])
+        port_affected = [ni for ni in affected if ni in self.port_net_idx]
         hpwl_before = sum(self._net_hpwl(self.net_state[ni])
                           for ni in affected)
         rudy_before = self._local_rudy(affected)
+        escape_before = sum(self._net_escape(ni) for ni in port_affected)
 
         # commit placement and refresh only the affected net states
         self.placement[inst_idx] = (x, y, rot)
@@ -369,13 +418,20 @@ class RLEnvironment:
         hpwl_after = sum(self._net_hpwl(self.net_state[ni])
                          for ni in affected)
         rudy_after = self._local_rudy(affected)
+        escape_after = sum(self._net_escape(ni) for ni in port_affected)
 
         hpwl_delta = hpwl_after - hpwl_before
         self.hpwl_accum += hpwl_delta
         reward = (-(hpwl_delta
                     + math.sqrt(max(rudy_after, 0.0))
                     - math.sqrt(max(rudy_before, 0.0)))
-                  - overlap_inc * self.overlap_penalty)
+                  - overlap_inc * self.overlap_penalty
+                  # a reduction in port-net distance to the die boundary
+                  # yields a positive reward
+                  - self.w_escape * (escape_after - escape_before)
+                  # mild Manhattan pull toward the origin (die corner) so
+                  # instances pack instead of scattering over the whole die
+                  - self.w_compact * (x + y))
 
         done = len(self.placement) == self.problem.n
         if done and self.w_sym:
@@ -389,12 +445,64 @@ class RLEnvironment:
 # Solver
 # ---------------------------------------------------------------------------
 
+def _compact_self_symmetric_column(problem, placement):
+    """Pack a self-symmetric block group into a tight vertical column.
+
+    ALIGN's analog constraint sets frequently declare a group whose pairs are
+    all *singletons* (self-symmetric blocks).  Legalisation snaps every such
+    block onto the group's mirror axis, so blocks may only be separated along
+    ``y``.  If the RL scatter left their y-bands overlapping, the axis snap
+    reintroduces overlaps that ``deoverlap`` cannot fix (it pushes along
+    ``x``, which the snap immediately undoes).
+
+    This pass is applied after legalisation as the final compaction stage:
+    it keeps the RL-learned relative (y) ordering, re-derives the *minimum*
+    feasible axis so the column hugs the origin, stacks the group's blocks
+    contiguously from ``y = 0``, and stacks any remaining free instances in a
+    parallel column immediately to the right.  The result is overlap-free and
+    keeps the learned ordering.  It is a no-op unless the module has exactly
+    one V-axis group made only of singletons.
+    """
+    groups = getattr(problem, 'symmetry', None) or []
+    if len(groups) != 1:
+        return placement
+    group = groups[0]
+    if group.get('direction', 'V') != 'V':
+        return placement
+    if any(len(pair) != 1 for pair in group['pairs']):
+        return placement
+    members = [pair[0] for pair in group['pairs']]
+    member_set = set(members)
+    insts = problem.instances
+    if not members:
+        return placement
+    axis = max(insts[i]['width'] / 2.0 for i in members)
+    pl = {i: tuple(v) for i, v in placement.items()}
+
+    # group column: preserve the RL ordering but make the y-bands disjoint
+    y = 0
+    for i in sorted(members, key=lambda k: (pl[k][1], pl[k][0])):
+        w, h = insts[i]['width'], insts[i]['height']
+        pl[i] = (int(round(axis - w / 2.0)), int(y), pl[i][2])
+        y += h
+    col_right = max(pl[i][0] + insts[i]['width'] for i in members)
+
+    # free instances: parallel column flush against the group column
+    y = 0
+    free = [i for i in range(problem.n) if i not in member_set]
+    for i in sorted(free, key=lambda k: (pl[k][1], pl[k][0])):
+        w, h = insts[i]['width'], insts[i]['height']
+        pl[i] = (int(col_right), int(y), pl[i][2])
+        y += h
+    return pl
+
+
 class RLPlacementSolver:
     """PPO over ``RLEnvironment``.  Returns the best-seen placement."""
 
-    def __init__(self, problem, *, seed=0, n_episodes=200, grid=32,
+    def __init__(self, problem, *, seed=0, n_episodes=1000, grid=32,
                  lr=3e-4, gamma=0.99, clip=0.2, updates_per_iter=4,
-                 temperature=1.0):
+                 temperature=1.0, temperature_end=0.3):
         if not _HAS_TORCH:
             raise RuntimeError('torch not installed; use SAPackingSolver')
         self.problem = problem
@@ -403,7 +511,12 @@ class RLPlacementSolver:
         self.gamma = gamma
         self.clip = clip
         self.updates = updates_per_iter
-        self.temperature = max(float(temperature), 1e-6)
+        # Temperature is annealed from ``temperature`` to ``temperature_end``
+        # over the episode budget: early episodes explore the grid, late ones
+        # exploit the learned packing policy.
+        self.temperature_start = max(float(temperature), 1e-6)
+        self.temperature_end = max(float(temperature_end), 1e-6)
+        self.temperature = self.temperature_start
         torch.manual_seed(seed)
         self.policy = _PolicyNet(grid)
         self.opt = torch.optim.Adam(self.policy.parameters(), lr=lr)
@@ -517,7 +630,11 @@ class RLPlacementSolver:
     def solve(self):
         best_placement = None
         best_reward = float('-inf')
+        span = max(self.n_episodes - 1, 1)
         for ep in range(self.n_episodes):
+            self.temperature = (self.temperature_start
+                                + (self.temperature_end
+                                   - self.temperature_start) * ep / span)
             traj, reward = self._episode()
             if reward > best_reward:
                 best_reward = reward
@@ -525,7 +642,8 @@ class RLPlacementSolver:
             self._update(traj)
             if ep % 50 == 0:
                 logger.info(f'RL placer ({self.problem.name}): episode {ep}, '
-                            f'return {reward:.2f}, best {best_reward:.2f}')
+                            f'return {reward:.2f}, best {best_reward:.2f}, '
+                            f'temp {self.temperature:.3f}')
         if best_placement is not None:
             # The RL policy scatters instances on a coarse grid, so the raw
             # output overlaps heavily and ignores the module's hard symmetry
@@ -535,9 +653,25 @@ class RLPlacementSolver:
             if getattr(self.problem, 'symmetry', None):
                 best_placement, _ = legalizer.legalize(self.problem,
                                                        best_placement)
+                # Final compaction: self-symmetric singleton groups can only
+                # separate along y after the axis snap, so pack them into a
+                # tight origin-hugging column (preserving the learned order).
+                best_placement = _compact_self_symmetric_column(
+                    self.problem, best_placement)
             else:
                 best_placement = legalizer.deoverlap(best_placement,
                                                      self.problem)
+            # Compact at the origin: the legaliser can leave a left/bottom
+            # margin, which inflates the emitted bbox and pushes the router's
+            # boundary pins away from the packed instances.
+            boxes = self.problem.placements_to_boxes(best_placement)
+            if boxes:
+                minx = min(b[0] for b in boxes.values())
+                miny = min(b[1] for b in boxes.values())
+                if minx or miny:
+                    best_placement = {
+                        i: (x - minx, y - miny, o)
+                        for i, (x, y, o) in best_placement.items()}
             boxes = self.problem.placements_to_boxes(best_placement)
             bbox = (max(b[2] for b in boxes.values()),
                     max(b[3] for b in boxes.values()))
@@ -546,6 +680,10 @@ class RLPlacementSolver:
             energy = (parts.hpwl
                       + math.sqrt(max(parts.congestion, 0.0))
                       + parts.overlap)
+            logger.info(
+                f'RL placer ({self.problem.name}): final bbox {bbox}, '
+                f'escape {escape_cost(best_placement, self.problem, self.env.port_net_idx):.1f}, '
+                f'hpwl {parts.hpwl:.1f}, overlap {parts.overlap:.3g}')
         else:
             bbox = None
             energy = -best_reward

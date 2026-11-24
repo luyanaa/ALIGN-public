@@ -5,7 +5,8 @@ import pytest
 
 from align.pnr.placer_rl.cost_model import (
     PlacementProblem, HPWLMetric, RUDYCongestion, overlap_area, make_cost,
-    raw_components, CostComponents, symmetry_penalty)
+    raw_components, CostComponents, symmetry_penalty, escape_cost,
+    infer_port_nets)
 from align.pnr.placer_rl.sequence_pair import SequencePair
 from align.pnr.placer_rl.sa_solver import SAPackingSolver
 from align.pnr.placer_rl.driver import build_problem
@@ -236,3 +237,80 @@ def test_legalize_snaps_pairs_exactly_mirrored_about_axis():
                 cl = ((2 * out[i][0] + p.instances[i]['width'])
                       + (2 * out[j][0] + p.instances[j]['width']))
                 assert abs(cl - 4 * axis) <= 1
+
+
+# ---------------------------------------------------------------------------
+# Boundary-escape cost and port-net identification
+# ---------------------------------------------------------------------------
+
+def _port_problem():
+    instances = [
+        {'instance_name': 'A', 'concrete_template_name': 'L',
+         'width': 10, 'height': 10, 'rotatable': True},
+        {'instance_name': 'B', 'concrete_template_name': 'L',
+         'width': 10, 'height': 10, 'rotatable': True},
+        {'instance_name': 'C', 'concrete_template_name': 'L',
+         'width': 10, 'height': 10, 'rotatable': True},
+    ]
+    nets = [
+        {'name': 'VDD', 'pins': [{'inst': 0, 'pin': 'p'},
+                                 {'inst': 1, 'pin': 'p'}]},
+        {'name': 'NET10', 'pins': [{'inst': 0, 'pin': 'p'},
+                                   {'inst': 2, 'pin': 'p'}]},
+    ]
+    return PlacementProblem('P', instances, nets, port_nets={'VDD'})
+
+
+def test_infer_port_nets_from_names():
+    nets = [
+        {'name': 'VDD', 'pins': []},
+        {'name': '0', 'pins': []},
+        {'name': 'VINN', 'pins': []},
+        {'name': 'ID', 'pins': []},
+        {'name': 'NET10', 'pins': []},
+        {'name': 'n2', 'pins': []},
+    ]
+    assert infer_port_nets(nets) == {'VDD', '0', 'VINN', 'ID'}
+    # explicit module parameters win (plus power/ground)
+    assert infer_port_nets(nets, parameters=['VINN']) == {'VDD', '0', 'VINN'}
+
+
+def test_build_problem_populates_port_nets():
+    module = {
+        'abstract_name': 'TOP',
+        'instances': [
+            {'instance_name': 'I1', 'abstract_template_name': 'NA',
+             'fa_map': [{'formal': 'D', 'actual': 'VDD'},
+                        {'formal': 'G', 'actual': '0'},
+                        {'formal': 'S', 'actual': 'NET0'}]},
+            {'instance_name': 'I2', 'abstract_template_name': 'NB',
+             'fa_map': [{'formal': 'D', 'actual': 'VDD'},
+                        {'formal': 'G', 'actual': '0'},
+                        {'formal': 'S', 'actual': 'NET0'}]},
+        ],
+    }
+    prob = build_problem(module, {'NA': (10, 10), 'NB': (10, 10)})
+    assert 'VDD' in prob.port_nets
+    assert '0' in prob.port_nets
+    assert 'NET0' not in prob.port_nets
+
+
+def test_escape_cost_zero_at_edge_positive_interior():
+    p = _port_problem()
+    die = (100, 100)
+    # both VDD pins sit on the left edge -> nearest-edge distance 0
+    at_edge = {0: (0, 40, 0), 1: (0, 50, 0), 2: (80, 80, 0)}
+    assert escape_cost(at_edge, p, p.port_nets, die=die) == 0.0
+    # VDD pins in the middle -> positive distance to every edge
+    interior = {0: (40, 40, 0), 1: (50, 50, 0), 2: (0, 0, 0)}
+    assert escape_cost(interior, p, p.port_nets, die=die) > 0.0
+    # the non-port net (NET10) does not contribute even when interior
+    only_nonport = {0: (0, 40, 0), 1: (0, 50, 0), 2: (40, 40, 0)}
+    assert escape_cost(only_nonport, p, p.port_nets, die=die) == 0.0
+
+
+def test_escape_cost_partial_placement_uses_problem_die():
+    p = _port_problem()
+    p.die = (100, 100)
+    partial = {0: (40, 40, 0)}          # only one VDD pin placed
+    assert escape_cost(partial, p) == 40.0
