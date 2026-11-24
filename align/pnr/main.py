@@ -190,7 +190,8 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
                  gds_json=False, PDN_mode=False, router_mode='top_down', router='astar', gui=False, skipGDS=False, steps_to_run,lambda_coeff,
                  nroutings=1, select_in_ILP=False, place_using_ILP=False, seed=0, use_analytical_placer=False, ilp_solver='symphony',
                  placer_sa_iterations=10000, placer_ilp_runtime=1, placer=None, black_box_flow=False, ndrfn=None, gui_port=None,
-                 rl_episodes=200, wire_planner=False, detail_router_workers=None):
+                 rl_episodes=200, wire_planner=False, detail_router_workers=None,
+                 route_score=False):
 
     subckt = subckt.upper()
 
@@ -413,10 +414,25 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
 
     if '3_pnr:route' in steps_to_run:
 
-        assert nroutings == 1, "nroutings other than 1 is currently not working"
+        # The C++ router only supports a single routing pass.  The Python
+        # detailed router (detail_py) emits its own per-variant Results
+        # files, so it is not bound by this restriction.
+        if router not in ('detail_py', 'detail_py_mip'):
+            assert nroutings == 1, "nroutings other than 1 is currently not working"
+
+        # Route-scored variant selection: when requested for the RL placer
+        # + Python detailed router, route *all* produced placement variants
+        # and keep only the best-routed one (see _detail_py_route).
+        route_score_mode = (placer == 'rl' and route_score
+                            and router in ('detail_py', 'detail_py_mip'))
 
         if placements_to_run is None:
-            verilog_ds_to_run = [(f'{top_level}_{i}', placement_verilog_alternatives[f'{top_level}_{i}']) for i in range(min(nroutings, len(placement_verilog_alternatives)))]
+            if route_score_mode:
+                verilog_ds_to_run = [
+                    (nm, v_d)
+                    for nm, v_d in placement_verilog_alternatives.items()]
+            else:
+                verilog_ds_to_run = [(f'{top_level}_{i}', placement_verilog_alternatives[f'{top_level}_{i}']) for i in range(min(nroutings, len(placement_verilog_alternatives)))]
         else:
             verilog_ds_to_run = [(f'{top_level}_{i}', placement_verilog_alternatives[f'{top_level}_{i}']) for i in placements_to_run]
 
@@ -470,7 +486,8 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
                 working_dir=working_dir,
                 primitives=primitives,
                 n_workers=detail_router_workers,
-                wire_planner=wire_planner)
+                wire_planner=wire_planner,
+                route_score=route_score_mode)
         else:
             results_name_map = router_driver(cap_map=cap_map, cap_lef_s=cap_lef_s,
                                              numLayout=toplevel_args_d['nvariants'], effort=toplevel_args_d['effort'],
@@ -514,12 +531,32 @@ def generate_pnr(topology_dir, primitive_dir, pdk_dir, output_dir, subckt, *, pr
     return variants
 
 
+def _detail_py_wirelength(terminals):
+    """Total wirelength (summed half-perimeter) over drawing shapes."""
+    total = 0
+    for t in terminals:
+        if t.get('netType') != 'drawing':
+            continue
+        x0, y0, x1, y1 = t['rect']
+        total += (x1 - x0) + (y1 - y0)
+    return total
+
+
 def _detail_py_route(*, verilog_ds_to_run, backend, input_dir, pdk_file,
-                     working_dir, primitives, n_workers, wire_planner):
+                     working_dir, primitives, n_workers, wire_planner,
+                     route_score=False):
     """Run the Python detailed router over every placement variant.
 
     Writes ``Results/<variant>.json`` (router-output schema) and returns
     ``{variant: None}`` for bookkeeping -- the file itself is the result.
+
+    When ``route_score`` is set, every variant is routed and scored
+    (``status == 'ok'`` with ``nets > 0`` wins, ties broken by minimum
+    total wirelength); scores are written to
+    ``working_dir/__route_scores__.json`` and only the winning variant
+    is returned so downstream GDS/viewer steps emit just the
+    best-routed layout.  Variants are always routed sequentially: the
+    underlying ``route_parallel`` already spawns a multiprocessing Pool.
     """
     from .detail_router.driver import detail_route_module
     from .placer_rl.leaf_collateral import load_leaf_collateral
@@ -530,6 +567,7 @@ def _detail_py_route(*, verilog_ds_to_run, backend, input_dir, pdk_file,
     results_dir = working_dir / 'Results'
     results_dir.mkdir(exist_ok=True)
     produced = {}
+    scores = {}
     for variant_name, v_d in verilog_ds_to_run:
         # ``v_d`` may be a VerilogJsonTop (pydantic) or a plain dict
         md = v_d.dict() if hasattr(v_d, 'dict') else v_d
@@ -552,10 +590,17 @@ def _detail_py_route(*, verilog_ds_to_run, backend, input_dir, pdk_file,
                 n_workers=n_workers, input_dir=input_dir)
         except Exception:
             logger.exception(f'detail_py router failed for {variant_name}')
+            if route_score:
+                scores[variant_name] = {'ok': False, 'nets': 0,
+                                        'wirelength': None}
             continue
         if report.get('status') != 'ok':
             logger.error(f'detail_py router failed for {variant_name}: '
                          f'{report}')
+            if route_score:
+                scores[variant_name] = {'ok': False,
+                                        'nets': report.get('nets', 0),
+                                        'wirelength': None}
             continue
         out = {'bbox': module['bbox'],
                'globalRoutes': [],
@@ -566,5 +611,28 @@ def _detail_py_route(*, verilog_ds_to_run, backend, input_dir, pdk_file,
         logger.info(f'detail_py router: {variant_name} -> '
                     f'{report["terminals"]} terminals, '
                     f'{report["nets"]} nets')
+        if route_score:
+            # A hierarchical module whose leaves are all black-boxed can
+            # route *zero* nets yet still report ok; treat that as a
+            # failure so it never wins selection.
+            ok = report.get('nets', 0) > 0
+            scores[variant_name] = {
+                'ok': bool(ok),
+                'nets': report.get('nets', 0),
+                'wirelength': _detail_py_wirelength(terminals)}
         produced[variant_name] = None
+    if route_score:
+        (working_dir / '__route_scores__.json').write_text(
+            json.dumps(scores, indent=2))
+        scored = [(nm, sc) for nm, sc in scores.items()
+                  if sc['wirelength'] is not None]
+        if scored:
+            winner, _ = min(
+                scored,
+                key=lambda item: (0 if item[1]['ok'] else 1,
+                                  item[1]['wirelength']))
+            logger.info(f'detail_py route-scored winner: {winner}')
+            produced = {winner: None}
+        else:
+            produced = {}
     return produced

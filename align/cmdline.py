@@ -183,6 +183,12 @@ class CmdlineParser():
                             help='Training episodes for the RL placer '
                                  '(only with --placer rl)')
 
+        parser.add_argument('--route_score',
+                            action='store_true',
+                            help='route all RL placement variants with '
+                                 'detail_py and emit only the best-routed '
+                                 'layout')
+
         parser.add_argument('--ilp_solver',
                             type=str,
                             default='symphony',

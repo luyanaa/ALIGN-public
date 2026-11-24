@@ -127,7 +127,8 @@ def schematic2layout(netlist_dir, pdk_dir, netlist_file=None, subckt=None, worki
                      flow_stop=None, router_mode='top_down', router='astar', gui=False, skipGDS=False, lambda_coeff=1.0,
                      nroutings=1, viewer=False, select_in_ILP=False, place_using_ILP=False, seed=0, use_analytical_placer=False, ilp_solver='symphony',
                      placer_sa_iterations=10000, placer_ilp_runtime=1, placer=None, blackbox_dir=None, scale=1e3, port=None,
-                      rl_episodes=200, wire_planner=False, detail_router_workers=None):
+                      rl_episodes=200, wire_planner=False, detail_router_workers=None,
+                      route_score=False):
 
     steps_to_run = build_steps(flow_start, flow_stop)
 
@@ -200,7 +201,8 @@ def schematic2layout(netlist_dir, pdk_dir, netlist_file=None, subckt=None, worki
                                 ilp_solver=ilp_solver,
                                 placer_sa_iterations=placer_sa_iterations, placer_ilp_runtime=placer_ilp_runtime, placer=placer, black_box_flow=(blackbox_dir != None), ndrfn=ndrfn, gui_port=port,
                                 rl_episodes=rl_episodes, wire_planner=wire_planner,
-                                detail_router_workers=detail_router_workers)
+                                detail_router_workers=detail_router_workers,
+                                route_score=route_score)
 
         results.append((subckt, variants))
 
