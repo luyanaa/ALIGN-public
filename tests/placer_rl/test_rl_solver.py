@@ -198,3 +198,37 @@ def test_terminal_reward_includes_symmetry_term():
     pen = symmetry_penalty(placement, p)
     assert pen > 0
     assert abs(r1 - (r0 - W * pen)) < 1e-6 * max(abs(r0), 1.0)
+
+
+# ---------------------------------------------------------------------------
+# (f) solve() legalises the grid scatter onto the symmetry axes
+# ---------------------------------------------------------------------------
+
+def test_solve_legalises_symmetric_pairs_exactly():
+    """The RL policy emits a grid scatter; ``solve()`` must run the shared
+    legaliser so symmetric pairs come back exactly mirrored about one axis
+    per group (to integer rounding), unlike the raw episode placement."""
+    p = symmetric_problem()
+    solver = RLPlacementSolver(p, seed=0, n_episodes=2, grid=8)
+    placement, bbox, energy = solver.solve()
+    assert set(placement) == set(range(p.n))
+    assert bbox is not None and math.isfinite(energy)
+
+    for group in p.symmetry:
+        sums = []
+        for pair in group['pairs']:
+            assert len(pair) == 2
+            i, j = pair
+            xi, yi, _ = placement[i]
+            xj, yj, _ = placement[j]
+            wi, hi = p.instances[i]['width'], p.instances[i]['height']
+            wj, hj = p.instances[j]['width'], p.instances[j]['height']
+            # doubled centreline sum: 2*(2*centre) == 4*axis for each pair,
+            # so every pair in a group shares one (doubled) axis value.
+            sums.append((2 * xi + wi) + (2 * xj + wj))
+            # perpendicular (y) centres of the pair are aligned
+            assert abs((2 * yi + hi) - (2 * yj + hj)) <= 1
+        # exact mirroring: pair centreline sums agree up to the integer
+        # rounding of the partner derivation (<= 2 in the doubled sum).
+        assert max(sums) - min(sums) <= 2
+

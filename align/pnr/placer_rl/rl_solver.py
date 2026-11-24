@@ -25,7 +25,8 @@ import random
 import re
 
 from .cost_model import (HPWLMetric, RUDYCongestion, _strict_intersection_area,
-                         symmetry_penalty)
+                         raw_components, symmetry_penalty)
+from . import legalizer
 
 logger = logging.getLogger(__name__)
 
@@ -526,12 +527,29 @@ class RLPlacementSolver:
                 logger.info(f'RL placer ({self.problem.name}): episode {ep}, '
                             f'return {reward:.2f}, best {best_reward:.2f}')
         if best_placement is not None:
+            # The RL policy scatters instances on a coarse grid, so the raw
+            # output overlaps heavily and ignores the module's hard symmetry
+            # constraints.  Turn it into a routable floorplan with the shared
+            # legaliser: pair-locked symmetry snapping + de-overlap (or plain
+            # de-overlap when the module has no symmetry).
+            if getattr(self.problem, 'symmetry', None):
+                best_placement, _ = legalizer.legalize(self.problem,
+                                                       best_placement)
+            else:
+                best_placement = legalizer.deoverlap(best_placement,
+                                                     self.problem)
             boxes = self.problem.placements_to_boxes(best_placement)
             bbox = (max(b[2] for b in boxes.values()),
                     max(b[3] for b in boxes.values()))
+            # Re-score the legalised placement with the shared cost model.
+            parts = raw_components(best_placement, self.problem)
+            energy = (parts.hpwl
+                      + math.sqrt(max(parts.congestion, 0.0))
+                      + parts.overlap)
         else:
             bbox = None
-        return best_placement, bbox, -best_reward
+            energy = -best_reward
+        return best_placement, bbox, energy
 
     def _update(self, traj):  # pragma: no cover - exercised via solve()
         if not traj:
