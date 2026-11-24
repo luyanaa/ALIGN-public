@@ -350,3 +350,61 @@ def test_solve_self_symmetric_singletons_packs_legal_column():
     # tight column: bbox height is the sum of the stacked group heights
     assert bbox[1] == sum(p.instances[i]['height'] for i in (0, 1, 2))
     assert bbox[0] == col_right + p.instances[3]['width']
+
+
+# ---------------------------------------------------------------------------
+# (h) learned placement-order pointer + PPO entropy bonus
+# ---------------------------------------------------------------------------
+
+def test_pointer_produces_permutation():
+    """The pointer head places every instance exactly once (a permutation)."""
+    p = symmetric_problem()
+    solver = RLPlacementSolver(p, seed=0, n_episodes=1, grid=8,
+                               use_pointer=True)
+    traj, _ = solver._episode()
+    order = solver.last_order
+    assert len(order) == p.n
+    assert sorted(order) == list(range(p.n))
+    # trajectory inst indices match the emitted order
+    assert [t[0] for t in traj] == order
+    # each pointer logp is part of the sampled log-prob
+    assert torch.isfinite(torch.stack([t[6] for t in traj])).all()
+
+
+def test_pointer_false_reproduces_random_order():
+    """``use_pointer=False`` keeps today's random-order behaviour exactly."""
+    p = symmetric_problem()
+    solver = RLPlacementSolver(p, seed=0, n_episodes=1, grid=8,
+                               use_pointer=False)
+    traj, _ = solver._episode()
+    assert solver.last_order == solver.env.order
+    assert sorted(solver.last_order) == list(range(p.n))
+    # ablation still completes a full solve
+    placement, _, _ = solver.solve()
+    assert set(placement) == set(range(p.n))
+
+
+def test_entropy_bonus_finite_and_changes_loss():
+    """The entropy term is finite and shifts the PPO loss when enabled."""
+    p = symmetric_problem()
+    solver = RLPlacementSolver(p, seed=0, n_episodes=1, grid=8,
+                               use_pointer=True)
+    traj, _ = solver._episode()
+
+    solver.entropy_coef = 0.0
+    loss0, ent0 = solver._evaluate_traj(traj)
+    assert math.isfinite(float(loss0.detach()))
+    assert math.isfinite(float(ent0.detach())) and float(ent0.detach()) > 0.0
+
+    # The raw value loss is large (returns are HPWL-scale) and float32, so use
+    # a coefficient that makes the entropy shift well above float precision.
+    coef = 1e4 / float(ent0.detach())
+    solver.entropy_coef = coef
+    loss1, ent1 = solver._evaluate_traj(traj)
+
+    assert torch.allclose(ent0, ent1)
+    # subtracting coef * entropy makes the loss strictly smaller
+    assert float(loss1.detach()) < float(loss0.detach())
+    assert math.isclose(float(loss0.detach() - loss1.detach()), 1e4,
+                        rel_tol=1e-2)
+

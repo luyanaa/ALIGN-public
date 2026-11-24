@@ -1,7 +1,10 @@
 """PPO-based sequential placer (RALF's ``main_RL_placement.py`` equivalent).
 
-Environment model: instances of one module are placed one at a time in a
-random order.  An action is ``(x, y, rotation)`` on a coarse die grid.
+Environment model: instances of one module are placed one at a time.  The
+placement **order** is chosen by a learned pointer head over the unplaced
+instances (RALF D2RL's "which instance next" policy); ``use_pointer=False``
+falls back to a random order for ablation.  An action is
+``(x, y, rotation)`` on a coarse die grid.
 
 This module follows RALF's actual network structure more closely than the
 earlier toy MLP:
@@ -159,9 +162,14 @@ if _HAS_TORCH:
           * per-step state = [h_current, g, placed_frac, running_hpwl_norm]
           * torso = Linear(->128) ReLU Linear(->128) ReLU
           * heads = x_bin(grid), y_bin(grid), rot(2), value(1)
+          * pointer head (4th categorical): additive attention
+            ``score_i = v^T tanh(W1 h_i + W2 ctx)`` over the *unplaced*
+            instances, with ``ctx = [g, placed_frac, hpwl_norm, h_last]``.
+            Its logits are masked to ``-inf`` on already-placed instances so
+            the softmax is a distribution over the remaining set.
 
-        Placement order is left random (RALF shuffles each episode); a
-        learned pointer over unplaced instances is a natural later upgrade.
+        The pointer log-prob is added to the action log-prob and its entropy
+        to the PPO entropy bonus; the x/y/rot entropy is also included.
         """
 
         N_CONT = 4     # [w/die, h/die, degree_norm, is_sym]
@@ -188,6 +196,12 @@ if _HAS_TORCH:
             self.y_head = nn.Linear(torso_hidden, grid)
             self.r_head = nn.Linear(torso_hidden, self.N_ROT)
             self.v_head = nn.Linear(torso_hidden, 1)
+            # -- learned placement-order pointer (additive attention) --------
+            # ctx = [g (2*hidden), placed_frac, hpwl_norm, h_last (hidden)]
+            self.ptr_ctx_dim = 3 * hidden + 2
+            self.ptr_w1 = nn.Linear(hidden, hidden)
+            self.ptr_w2 = nn.Linear(self.ptr_ctx_dim, hidden)
+            self.ptr_v = nn.Linear(hidden, 1, bias=False)
 
         def encode(self, dev_ids, inst_cont, net_feat, edges_i2n, edges_n2i):
             x = torch.cat([self.dev_embed(dev_ids), inst_cont], dim=-1)
@@ -209,6 +223,24 @@ if _HAS_TORCH:
             z = self.torso(state)
             return (self.x_head(z), self.y_head(z), self.r_head(z),
                     self.v_head(z))
+
+        def pointer_scores(self, h_i, g, placed_frac, hpwl_norm, last_h,
+                           available=None):
+            """Additive-attention score for every instance (masked logits).
+
+            ``score_i = v^T tanh(W1 h_i + W2 [g, placed_frac, hpwl_norm,
+            h_last])``.  ``available`` is an optional boolean mask of shape
+            ``(n,)``; unavailable (already-placed) instances get ``-1e30`` so
+            a softmax over the vector is a distribution over unplaced ones.
+            """
+            prog = torch.tensor([placed_frac, hpwl_norm],
+                                dtype=h_i.dtype, device=h_i.device)
+            ctx = torch.cat([g, prog, last_h], dim=-1)
+            z = torch.tanh(self.ptr_w1(h_i) + self.ptr_w2(ctx))
+            scores = self.ptr_v(z).squeeze(-1)
+            if available is not None:
+                scores = scores.masked_fill(~available, -1e30)
+            return scores
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +534,8 @@ class RLPlacementSolver:
 
     def __init__(self, problem, *, seed=0, n_episodes=1000, grid=32,
                  lr=3e-4, gamma=0.99, clip=0.2, updates_per_iter=4,
-                 temperature=1.0, temperature_end=0.3):
+                 temperature=1.0, temperature_end=0.3,
+                 use_pointer=True, entropy_coef=0.01):
         if not _HAS_TORCH:
             raise RuntimeError('torch not installed; use SAPackingSolver')
         self.problem = problem
@@ -511,6 +544,9 @@ class RLPlacementSolver:
         self.gamma = gamma
         self.clip = clip
         self.updates = updates_per_iter
+        # Learned placement-order pointer (RALF D2RL) and PPO entropy bonus.
+        self.use_pointer = bool(use_pointer)
+        self.entropy_coef = float(entropy_coef)
         # Temperature is annealed from ``temperature`` to ``temperature_end``
         # over the episode budget: early episodes explore the grid, late ones
         # exploit the learned packing policy.
@@ -602,13 +638,27 @@ class RLPlacementSolver:
     def _episode(self):
         self.env.reset()
         h_i, g = self._encode()
+        n = self.problem.n
         placed = set()
+        available = torch.ones(n, dtype=torch.bool)
+        last_h = h_i.new_zeros(self.policy.hidden)
         traj = []
         total_reward = 0.0
-        n = self.problem.n
         temp = self.temperature
+        order = []
         while len(placed) < n:
-            inst_idx = next(i for i in self.env.order if i not in placed)
+            if self.use_pointer:
+                scores = self.policy.pointer_scores(
+                    h_i, g, len(placed) / n,
+                    self.env.hpwl_accum / self.hpwl_scale, last_h,
+                    available)
+                ptr = torch.distributions.Categorical(logits=scores / temp)
+                idx_t = ptr.sample()
+                inst_idx = int(idx_t)
+                ptr_logp = ptr.log_prob(idx_t)
+            else:
+                inst_idx = next(i for i in self.env.order if i not in placed)
+                ptr_logp = None
             pf = len(placed) / n
             hn = self.env.hpwl_accum / self.hpwl_scale
             lx, ly, lr, v = self.policy.decode(h_i, g, inst_idx, pf, hn)
@@ -618,18 +668,25 @@ class RLPlacementSolver:
             dr = torch.distributions.Categorical(logits=lr)
             ax, ay, ar = dx.sample(), dy.sample(), dr.sample()
             logp = self._cat_logp(lx, ly, lr, ax, ay, ar)
+            if ptr_logp is not None:
+                logp = logp + ptr_logp
             _, reward, done = self.env.step(inst_idx, int(ax), int(ay),
                                             int(ar))
             traj.append((inst_idx, pf, hn, ax, ay, ar, logp, v, reward))
             placed.add(inst_idx)
+            available[inst_idx] = False
+            last_h = h_i[inst_idx].detach()
+            order.append(inst_idx)
             total_reward += reward
             if done:
                 break
+        self.last_order = order
         return traj, total_reward
 
     def solve(self):
         best_placement = None
         best_reward = float('-inf')
+        best_order = None
         span = max(self.n_episodes - 1, 1)
         for ep in range(self.n_episodes):
             self.temperature = (self.temperature_start
@@ -639,11 +696,14 @@ class RLPlacementSolver:
             if reward > best_reward:
                 best_reward = reward
                 best_placement = dict(self.env.placement)
+                best_order = list(getattr(self, 'last_order', []))
             self._update(traj)
             if ep % 50 == 0:
                 logger.info(f'RL placer ({self.problem.name}): episode {ep}, '
                             f'return {reward:.2f}, best {best_reward:.2f}, '
-                            f'temp {self.temperature:.3f}')
+                            f'temp {self.temperature:.3f}, '
+                            f'pointer {self.use_pointer}')
+        self.best_order = best_order
         if best_placement is not None:
             # The RL policy scatters instances on a coarse grid, so the raw
             # output overlaps heavily and ignores the module's hard symmetry
@@ -684,14 +744,46 @@ class RLPlacementSolver:
                 f'RL placer ({self.problem.name}): final bbox {bbox}, '
                 f'escape {escape_cost(best_placement, self.problem, self.env.port_net_idx):.1f}, '
                 f'hpwl {parts.hpwl:.1f}, overlap {parts.overlap:.3g}')
+            logger.info(
+                f'RL placer ({self.problem.name}): placement order '
+                f'({"pointer" if self.use_pointer else "random"}): '
+                f'{best_order}')
         else:
             bbox = None
             energy = -best_reward
         return best_placement, bbox, energy
 
-    def _update(self, traj):  # pragma: no cover - exercised via solve()
-        if not traj:
-            return
+    def _policy_terms(self, h_i, g, inst_idx, pf, hn, ax, ay, ar,
+                      last_h, available, temp):
+        """Log-prob, value and entropy of one trajectory step.
+
+        The pointer (placement-order) log-prob is added to the x/y/rot
+        log-prob when ``use_pointer`` is on; its categorical entropy is added
+        to the x/y/rot entropies (four distributions total).
+        """
+        lx, ly, lr, v = self.policy.decode(h_i, g, inst_idx, pf, hn)
+        lx, ly, lr = lx / temp, ly / temp, lr / temp
+        dx = torch.distributions.Categorical(logits=lx)
+        dy = torch.distributions.Categorical(logits=ly)
+        dr = torch.distributions.Categorical(logits=lr)
+        logp = self._cat_logp(lx, ly, lr, ax, ay, ar)
+        entropy = dx.entropy() + dy.entropy() + dr.entropy()
+        if self.use_pointer:
+            scores = self.policy.pointer_scores(
+                h_i, g, pf, hn, last_h, available) / temp
+            dptr = torch.distributions.Categorical(logits=scores)
+            idx_t = torch.as_tensor(inst_idx, dtype=torch.long)
+            logp = logp + dptr.log_prob(idx_t)
+            entropy = entropy + dptr.entropy()
+        return logp, v, entropy
+
+    def _evaluate_traj(self, traj):
+        """PPO loss (+ total entropy) for ``traj`` under current parameters.
+
+        Recomputes the graph embeddings and every head's log-prob/entropy so
+        gradients flow through the encoder and the pointer.  The entropy bonus
+        is ``-entropy_coef * sum_of_all_step_entropies`` (maximising entropy).
+        """
         rewards = [t[8] for t in traj]
         R = 0.0
         returns = []
@@ -705,21 +797,39 @@ class RLPlacementSolver:
         if adv.numel() > 1:
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         temp = self.temperature
+        h_i, g = self._encode()
+        n = self.problem.n
+        available = torch.ones(n, dtype=torch.bool)
+        last_h = h_i.new_zeros(self.policy.hidden)
+        logps, vals, ents = [], [], []
+        for (inst_idx, pf, hn, ax, ay, ar, _, _, _) in traj:
+            logp, v, ent = self._policy_terms(
+                h_i, g, inst_idx, pf, hn, ax, ay, ar,
+                last_h, available, temp)
+            logps.append(logp)
+            vals.append(v)
+            ents.append(ent)
+            available[inst_idx] = False
+            last_h = h_i[inst_idx].detach()
+        logps = torch.stack(logps)
+        vals = torch.stack(vals).squeeze(-1)
+        entropy = torch.stack(ents).sum()
+        ratio = torch.exp(logps - old_logp)
+        s1 = ratio * adv
+        s2 = torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * adv
+        loss = (-torch.min(s1, s2).mean()
+                + 0.5 * (returns - vals).pow(2).mean()
+                - self.entropy_coef * entropy)
+        return loss, entropy
+
+    def _update(self, traj):  # pragma: no cover - exercised via solve()
+        if not traj:
+            return
         for _ in range(self.updates):
-            h_i, g = self._encode()
-            logps, vals = [], []
-            for (inst_idx, pf, hn, ax, ay, ar, _, _, _) in traj:
-                lx, ly, lr, v = self.policy.decode(h_i, g, inst_idx, pf, hn)
-                lx, ly, lr = lx / temp, ly / temp, lr / temp
-                logps.append(self._cat_logp(lx, ly, lr, ax, ay, ar))
-                vals.append(v)
-            logps = torch.stack(logps)
-            vals = torch.stack(vals).squeeze(-1)
-            ratio = torch.exp(logps - old_logp)
-            s1 = ratio * adv
-            s2 = torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * adv
-            loss = (-torch.min(s1, s2).mean()
-                    + 0.5 * (returns - vals).pow(2).mean())
+            loss, entropy = self._evaluate_traj(traj)
             self.opt.zero_grad()
             loss.backward()
             self.opt.step()
+        self.last_loss = float(loss.detach())
+        self.last_entropy = float(entropy.detach())
+
