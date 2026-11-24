@@ -16,7 +16,8 @@ from collections import defaultdict
 
 from .cost_model import PlacementProblem
 from .sa_solver import SAPackingSolver
-from .rl_solver import RLPlacementSolver, torch_available
+from .rl_solver import (RLPlacementSolver, parse_device_type,
+                        torch_available)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,9 @@ def build_problem(module, leaf_sizes, ctn_of=None):
         instances.append({
             'instance_name': inst['instance_name'],
             'concrete_template_name': ctn,
+            'abstract_template_name': atn,
+            'dev_type': parse_device_type(ctn, atn),
+            'sym_group': -1,
             'width': dims[0],
             'height': dims[1],
             'rotatable': True,
@@ -98,6 +102,13 @@ def build_problem(module, leaf_sizes, ctn_of=None):
             if ok and pairs:
                 symmetry.append({'pairs': pairs,
                                  'direction': c.get('direction', 'V')})
+
+    # expose per-instance symmetry-group membership (-1 = unconstrained)
+    for gi, group in enumerate(symmetry):
+        for pair in group['pairs']:
+            for idx in pair:
+                if 0 <= idx < len(instances):
+                    instances[idx]['sym_group'] = gi
 
     return PlacementProblem(_modname(module), instances, net_list,
                             symmetry=symmetry)
